@@ -132,7 +132,7 @@ def _build_calib_iter(args, device, pipe, cfg):
     import numpy as _np
     from evaluate.eval_local_n_samples import (GT_LATENT_DIR, ANNOT_DIR, SEQUENCE_LENGTH,
                                                C_ACT_SCALER, compute_actions_for_slice,
-                                               gen_one, parse_key)
+                                               gen_one, parse_key, sample_generator)
     excluded = set()
     if args.eval_keys_file:
         excluded = set(json.load(open(args.eval_keys_file)))
@@ -169,7 +169,8 @@ def _build_calib_iter(args, device, pipe, cfg):
         grip = _np.array(ann["continuous_gripper_state"])[start:start + SEQUENCE_LENGTH]
         actions = torch.from_numpy(compute_actions_for_slice(arm, grip) * C_ACT_SCALER
                                    ).float().unsqueeze(0)
-        gen_one(pipe, gt_lat[0:1].unsqueeze(0), actions, cfg, device)
+        gen_one(pipe, gt_lat[0:1].unsqueeze(0), actions, cfg, device,
+                generator=sample_generator(fn[:-3], args.seed, device))
 
     return sel, run_forward, [fn[:-3] for fn, _ in sel]
 

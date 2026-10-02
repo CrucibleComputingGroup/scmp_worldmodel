@@ -131,7 +131,14 @@ def make_pipe(args, vae, model, scheduler_kind: str):
     return Trajectory2VideoGenPipeline(vae=vae, scheduler=scheduler, transformer=model)
 
 
-def gen_one(pipe, mask_x, actions, args, device):
+def sample_generator(key: str, seed: int, device):
+    """Per-sample noise generator, identical across arms for the same key, so
+    every config is scored on the SAME initial noise (paired comparison)."""
+    import zlib
+    return torch.Generator(device=device).manual_seed(int(seed) + zlib.crc32(key.encode()))
+
+
+def gen_one(pipe, mask_x, actions, args, device, generator=None):
     with torch.no_grad():
         videos, latents = pipe(
             actions.to(device).to(torch.float32),
@@ -141,6 +148,7 @@ def gen_one(pipe, mask_x, actions, args, device):
             num_inference_steps=args.infer_num_sampling_steps,
             guidance_scale=args.guidance_scale,
             device=device, return_dict=False, output_type="both",
+            generator=generator,
         )
     return videos, latents
 
@@ -206,6 +214,9 @@ def main():
                    help="bit width for --naive_int8 (WxAx, x=bits); 8 reproduces the original baseline")
     p.add_argument("--naive_asymm", action="store_true",
                    help="use asymmetric (zero-point) quantization instead of symmetric for --naive_int8")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Initial-noise seed; each sample uses seed + crc32(key), "
+                        "so arms are paired on identical noise.")
     cli = p.parse_args()
 
     args = build_args(cli.config, cli.inference_steps)
@@ -295,7 +306,8 @@ def main():
 
             cost_summary(clear=True)
             t0 = time.time()
-            videos, pred_lat = gen_one(pipe, mask_x, actions, args, device)
+            videos, pred_lat = gen_one(pipe, mask_x, actions, args, device,
+                                       generator=sample_generator(key, cli.seed, device))
             cyc = cost_summary(clear=True)
             dt = time.time() - t0
             pred_lat = pred_lat.squeeze(0)
@@ -339,7 +351,7 @@ def main():
         summary = {
             "tag": cli.tag, "shard": cli.shard, "num_shards": cli.num_shards,
             "variant": args.attention_mode, "skip": {k: list(v) for k, v in skip_map.items()},
-            "steps": args.infer_num_sampling_steps, "scheduler": cli.scheduler,
+            "steps": args.infer_num_sampling_steps, "scheduler": cli.scheduler, "seed": cli.seed,
             "n_samples_done": len(metrics),
             "mean_l2": round(mean_l2, 4), "mean_psnr": round(mean_psnr, 3), "mean_ssim": round(mean_ssim, 3),
             "mean_avg_cycles": (round(sum(cyc_vals) / len(cyc_vals), 3) if cyc_vals else None),
