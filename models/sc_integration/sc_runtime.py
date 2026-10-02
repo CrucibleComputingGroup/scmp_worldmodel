@@ -331,6 +331,8 @@ def configure_from_env(model=None, verbose: bool = True) -> dict:
                                  f"{_STATE['mp_table']['total_blocks']} != model {n}")
     if verbose:
         s = state()
+        from ._bootstrap import kernels_provenance
+        print(f"[env] scmp_kernels {kernels_provenance()}", flush=True)
         print(f"[sc] sc_prec={s['sc_prec']} halve={s['halve']} chunk_d={s['chunk_d']} "
               f"qk={s['qk_granularity']} av=per_row linear=per_row "
               f"uniform_stoc_len={resolve_stoc_len() if s['step_schedule'] is None else 'schedule'} "

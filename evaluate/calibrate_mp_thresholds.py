@@ -68,9 +68,9 @@ for _p in (str(_ROOT / "evaluate"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from models.sc_integration import sc_runtime as rt  # noqa: E402  (kernels bootstrap)
 from mp_objectives import objective_errors as _objective_errors  # noqa: E402
 from scmp_kernels import sc_matmul  # noqa: E402
-from models.sc_integration import sc_runtime as rt  # noqa: E402
 from models.sc_integration.sc_controller import get_current_step  # noqa: E402
 
 DEFAULT_OPERATORS = "qkv_proj,out_proj,mlp_fc1,mlp_fc2,qk,av"

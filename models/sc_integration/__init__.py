@@ -17,6 +17,7 @@ is not installed — run::
     git submodule update --init --recursive
     pip install -e ./kernels
 """
+from ._bootstrap import kernels_provenance  # noqa: F401  (must run first)
 from .sc_attention import sc_qk_matmul, sc_av_matmul
 from .sc_linear import sc_linear_forward
 from .sc_mlp import SCMlp
