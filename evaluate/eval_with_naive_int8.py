@@ -78,7 +78,8 @@ def naive_int8_av(attn: torch.Tensor, v: torch.Tensor, sc_prec: int = 8, stoc_le
     return torch.matmul(ad, vd).to(attn.dtype)
 
 
-def naive_int8_linear_forward(x: torch.Tensor, linear, sc_prec: int = 8, stoc_len=None) -> torch.Tensor:
+def naive_int8_linear_forward(x: torch.Tensor, linear, sc_prec: int = 8, stoc_len=None,
+                              op=None, block_idx=None) -> torch.Tensor:
     """y = (q(x) @ q(W)^T) + bias"""
     xd = _q_int8_per_tensor(x)
     wd = _q_int8_per_tensor(linear.weight)

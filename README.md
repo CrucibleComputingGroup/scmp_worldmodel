@@ -59,17 +59,38 @@ The `models/sc_integration/` package swaps selected matmuls in the diffusion
 transformer for bipolar int8 SC, computed by the shared `scmp_kernels.sc_matmul`
 kernel:
 
+The datapath and the mixed-precision (MP) mechanism follow
+[`scmp_vit`](https://github.com/CrucibleComputingGroup/scmp_vit)
+(`model/sc_vit.py`, `cls/calibrate_mp_thresholds.py`):
+
 | op | granularity | replaces |
 |----|-------------|----------|
-| `sc_qk_matmul`     | `per_head`   | Q·Kᵀ attention scores |
-| `sc_av_matmul`     | `per_head`   | softmax·V |
-| `sc_linear_forward` / `SCMlp` | `per_tensor` | `nn.Linear` projections (qkv / proj / fc1 / fc2) |
+| `sc_qk_matmul`     | `per_row` (`SC_QK_GRANULARITY=per_head` legacy) | Q·Kᵀ attention scores |
+| `sc_av_matmul`     | `per_row`    | softmax·V |
+| `sc_linear_forward` / `SCMlp` | `per_row` + `chunk_d=128` | `nn.Linear` projections (qkv / proj / fc1 / fc2) |
+
+Run-wide knobs (`models/sc_integration/sc_runtime.py`, read from the
+environment): `SC_PREC` (8), `SC_HALVE=1` (uSystolic stream halving),
+`SC_CHUNK_D` (128 — required on wide layers, unchunked SC collapses),
+`SC_UNIFORM_STOC_LEN` / `SC_STEP_SCHEDULE` (applies to **all** SC ops,
+attention included), `SC_SMOOTH_SCALES` (SmoothQuant pre-transform) and
+`SC_MP_TABLE=<wrapper.json>` (calibrated MP table, optionally restricted with
+`SC_MP_OPS`). Every eval sample records `avg_cycles`, the MAC-weighted realized
+stream length over all SC ops — the iso-compute axis.
+
+MP tables come from `evaluate/calibrate_mp_thresholds.py` (scmp_vit's
+calibrator with IRASim adapters); `scripts/run_mp_vit_protocol.sh` runs the
+scmp_vit formal recipe (ladder 64..16, budget 32, all six ops, W_g=macs, 2%
+protected channels). The pre-alignment knobs `SC_MP_CONFIG`,
+`SC_MP_PER_MODULE`, `SC_MP_INVERT` and `SC_LINEAR_GRANULARITY=per_tensor` were
+removed and raise.
 
 Which ops run on SC is driven by the `attention_mode` string in the config
 (presets in `models/sc_integration/sc_controller.py`), e.g. `sc_int8`
 (QK only) through `sc_int8_full` (all matmuls). Eval configs live under
 `configs/evaluation/bridge/frame_ada_sc*.yaml`. Per-block opt-outs are
-available via `set_skip_blocks()` / `clear_skip_blocks()`.
+available via `set_skip_blocks()` / `clear_skip_blocks()` (`--skip`); skipped
+groups run FP and are outside the SC budget.
 
 ## Dataset
 

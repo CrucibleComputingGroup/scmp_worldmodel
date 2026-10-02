@@ -39,7 +39,8 @@ from diffusers.schedulers import PNDMScheduler, DPMSolverMultistepScheduler
 
 from dataset.dataset_util import euler2rotm, rotm2euler
 from models import get_models
-from models.sc_integration import reconfigure, set_skip_blocks, clear_skip_blocks
+from models.sc_integration import (reconfigure, set_skip_blocks, clear_skip_blocks,
+                                   configure_from_env, cost_summary, sc_state)
 from sample.pipeline_trajectory2videogen import Trajectory2VideoGenPipeline
 from evaluate.compute_psnr_ssim import process_video_psnr_ssim
 from util import update_paths
@@ -67,6 +68,24 @@ def parse_skip(skip_str: str) -> dict:
         op, blocks = clause.split("=")
         out[op.strip()] = [int(x) for x in blocks.split(",") if x.strip()]
     return out
+
+
+def check_table_deployment(prov: dict, skip_map: dict, sq_path):
+    """An MP table is fitted on one deployment: the skipped (op, block) set and
+    the SmoothQuant transform both change which matmuls run on SC and what
+    operands they quantize. Refuse to deploy it under a different one."""
+    want_skip = {k: sorted(v) for k, v in (prov.get("skip") or {}).items() if v}
+    have_skip = {k: sorted(v) for k, v in skip_map.items() if v}
+    if "skip" in prov and want_skip != have_skip:
+        raise SystemExit(f"MP table was calibrated with skip={want_skip} but this "
+                         f"run uses skip={have_skip}")
+    if "smoothquant_scales" in prov:
+        want = prov["smoothquant_scales"]
+        have = os.path.abspath(sq_path) if sq_path else None
+        if (want is None) != (have is None) or (want and os.path.basename(want)
+                                                != os.path.basename(have)):
+            raise SystemExit(f"MP table was calibrated with SC_SMOOTH_SCALES={want} "
+                             f"but this run uses {have}")
 
 
 def build_args(config_path: str, infer_steps: int):
@@ -217,6 +236,9 @@ def main():
     clear_skip_blocks()
     for op, blocks in skip_map.items():
         set_skip_blocks(op, blocks)
+    sc_cfg = configure_from_env(model)
+    if sc_cfg["mp_table"]:
+        check_table_deployment(sc_cfg["mp_table"], skip_map, sq_path)
     pipe = make_pipe(args, vae, model, cli.scheduler)
     print(f"[shard {cli.shard}/{cli.num_shards}] variant={args.attention_mode} skip={skip_map} "
           f"steps={args.infer_num_sampling_steps} sched={cli.scheduler}", flush=True)
@@ -227,6 +249,12 @@ def main():
         all_files = [f"{k}.pt" for k in keys]
     else:
         all_files = sorted(f for f in os.listdir(GT_LATENT_DIR) if f.endswith(".pt"))[: cli.num_samples]
+    if sc_cfg["mp_table"] and sc_cfg["mp_table"].get("calib_keys"):
+        overlap = {f[:-3] for f in all_files} & set(sc_cfg["mp_table"]["calib_keys"])
+        if overlap:
+            raise SystemExit(f"{len(overlap)} eval samples were used to calibrate the "
+                             f"MP table (e.g. {sorted(overlap)[:3]}); evaluate on a "
+                             f"disjoint key set")
     shard_files = all_files[cli.shard::cli.num_shards]
     print(f"[shard {cli.shard}] {len(shard_files)}/{len(all_files)} samples", flush=True)
 
@@ -265,8 +293,10 @@ def main():
             actions = torch.from_numpy(actions_np).float().unsqueeze(0)
             mask_x = gt_lat[0:1].unsqueeze(0)
 
+            cost_summary(clear=True)
             t0 = time.time()
             videos, pred_lat = gen_one(pipe, mask_x, actions, args, device)
+            cyc = cost_summary(clear=True)
             dt = time.time() - t0
             pred_lat = pred_lat.squeeze(0)
             l2 = F.mse_loss(pred_lat[1:], gt_lat[1:]).item()
@@ -280,6 +310,11 @@ def main():
                 "psnr": round(float(ps["PSNR"]), 3),
                 "ssim": round(float(ps["SSIM"]), 3),
                 "infer_seconds": round(dt, 2),
+                # MAC-weighted realized stream length over every SC op
+                # (attention included) -- the iso-compute axis.
+                "avg_cycles": round(cyc["ALL"], 3),
+                "avg_cycles_per_op": {k: round(v, 3) for k, v in cyc.items()
+                                      if k not in ("ALL", "mac_share")},
             }
             with open(os.path.join(met_dir, f"{key}.json"), "w") as f:
                 json.dump(metric, f)
@@ -299,12 +334,22 @@ def main():
         mean_l2 = sum(m["latent_l2"] for m in metrics) / len(metrics)
         mean_psnr = sum(m["psnr"] for m in metrics) / len(metrics)
         mean_ssim = sum(m["ssim"] for m in metrics) / len(metrics)
+        cyc_vals = [m["avg_cycles"] for m in metrics if "avg_cycles" in m]
+        st = sc_state()
         summary = {
             "tag": cli.tag, "shard": cli.shard, "num_shards": cli.num_shards,
             "variant": args.attention_mode, "skip": {k: list(v) for k, v in skip_map.items()},
             "steps": args.infer_num_sampling_steps, "scheduler": cli.scheduler,
             "n_samples_done": len(metrics),
             "mean_l2": round(mean_l2, 4), "mean_psnr": round(mean_psnr, 3), "mean_ssim": round(mean_ssim, 3),
+            "mean_avg_cycles": (round(sum(cyc_vals) / len(cyc_vals), 3) if cyc_vals else None),
+            "sc": {"sc_prec": st["sc_prec"], "halve": st["halve"], "chunk_d": st["chunk_d"],
+                   "qk_granularity": st["qk_granularity"],
+                   "uniform_stoc_len": st["uniform_stoc_len"],
+                   "step_schedule": st["step_schedule"] is not None,
+                   "mp_table": (st["mp_table"] or {}).get("path"),
+                   "mp_ops": sorted(st["mp_ops"]),
+                   "smoothquant": os.environ.get("SC_SMOOTH_SCALES")},
             "per_sample": metrics,
         }
         with open(os.path.join(out_dir, f"summary_shard_{cli.shard}.json"), "w") as f:
