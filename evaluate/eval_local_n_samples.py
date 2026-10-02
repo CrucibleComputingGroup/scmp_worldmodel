@@ -214,6 +214,13 @@ def main():
                    help="bit width for --naive_int8 (WxAx, x=bits); 8 reproduces the original baseline")
     p.add_argument("--naive_asymm", action="store_true",
                    help="use asymmetric (zero-point) quantization instead of symmetric for --naive_int8")
+    p.add_argument("--int_baseline", choices=["int", "bitmod"], default=None,
+                   help="scmp_vit deterministic baselines over the SC ops: 'int' = W=A asym "
+                        "per-row x 128 chunk + per-row attention; 'bitmod' = BitMoD weights "
+                        "(--w_datatype, group 128) + INT8 activations/attention")
+    p.add_argument("--int_bits", type=int, default=8)
+    p.add_argument("--w_datatype", default="mixed_bitmod",
+                   help="BitMoD weight datatype for --int_baseline bitmod")
     p.add_argument("--seed", type=int, default=0,
                    help="Initial-noise seed; each sample uses seed + crc32(key), "
                         "so arms are paired on identical noise.")
@@ -228,6 +235,12 @@ def main():
         b = cli.naive_bits
         print(f"naive W{b}A{b}_{'asymm' if cli.naive_asymm else 'symm'} patches "
               f"installed over sc_* kernels", flush=True)
+
+    if cli.int_baseline:
+        if cli.naive_int8:
+            raise SystemExit("--int_baseline and --naive_int8 are exclusive")
+        from evaluate.int_baselines import install as install_int
+        print("int baseline:", install_int(cli.int_baseline, cli.int_bits, cli.w_datatype), flush=True)
 
     device = torch.device("cuda:0")
     vae = AutoencoderKL.from_pretrained(args.vae_model_path, subfolder="vae").to(device).eval()

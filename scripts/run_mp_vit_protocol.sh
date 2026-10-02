@@ -11,7 +11,9 @@
 #   CELLS="uni_32 mp_32" N=300 bash scripts/run_mp_vit_protocol.sh
 #   CELLS="fp int8 uni_128 uni_96 mp_96" LADDER=128,96,64,48,32,24,16 ...
 #
-# Cells: fp (FP model) | int<b> (naive symmetric WbAb, same ops + skip) |
+# Cells: fp (FP model) | int<b> (legacy naive per-tensor symmetric WbAb) |
+#        vint<b> (scmp_vit INT: W=A asym, per-row x 128 chunk, per-row attention) |
+#        bitmod<b>[_<dtype>] (BitMoD weights, default mixed_bitmod, g128 + INT8 act/attn) |
 #        uni_<L> (uniform SC, L halved cycles) | mp_<L> (calibrate + MP at budget L).
 # LADDER defaults to scmp_vit's L5 (64..16, the formal mp_32 ladder); budgets
 # >= 64 need L7 (128,96,64,48,32,24,16).
@@ -67,6 +69,9 @@ for c in $CELLS; do
   case "$c" in
     fp)    ev "${TAG_PREFIX}fp" "$FP_CONFIG" ;;
     int*)  b=${c#int}; ev "${TAG_PREFIX}$c" "$CONFIG" -- --naive_int8 --naive_bits "$b" ;;
+    vint*) b=${c#vint}; ev "${TAG_PREFIX}$c" "$CONFIG" -- --int_baseline int --int_bits "$b" ;;
+    bitmod*) r=${c#bitmod}; b=${r%%_*}; dt=mixed_bitmod; [ "$r" != "$b" ] && dt=${r#*_}
+           ev "${TAG_PREFIX}$c" "$CONFIG" -- --int_baseline bitmod --int_bits "$b" --w_datatype "$dt" ;;
     uni_*) b=${c#uni_}; ev "${TAG_PREFIX}$c" "$CONFIG" SC_UNIFORM_STOC_LEN="$b" ;;
     mp_*)  b=${c#mp_}; [ "$b" -lt "${LADDER%%,*}" ] || { echo "[mp] $c: budget must be below the ladder top ${LADDER%%,*}"; continue; }
            calib "$c" "$LADDER" "$b" \
