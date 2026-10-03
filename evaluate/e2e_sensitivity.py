@@ -132,6 +132,13 @@ def cmd_collect(a):
             if cost() > T + 1e-9:          # could not pay for it: undo
                 L[up["name"]] -= 8
                 break
+        # spend the leftover budget: +8 on the most sensitive groups that still fit
+        for g in sorted(groups, key=lambda g: -g["s"]):
+            while L[g["name"]] + 8 <= hi:
+                L[g["name"]] += 8
+                if cost() > T + 1e-9:
+                    L[g["name"]] -= 8
+                    break
         table = {"group_stoclen": {f"{g['op']}:b{b}": L[g["name"]] for g in groups for b in g["blocks"]},
                  "target": T, "realized_mac_avg": cost(), "method": "e2e_knockdown_lp",
                  "probe_L0": L0, "probe_step": step, "move": st}
