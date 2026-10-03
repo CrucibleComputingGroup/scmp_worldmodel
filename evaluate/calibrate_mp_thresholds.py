@@ -157,8 +157,11 @@ def _build_calib_iter(args, device, pipe, cfg):
     if len(sel) < args.n_calib_samples:
         raise ValueError(f"only {len(sel)} calibration keys available after "
                          f"excluding {len(excluded)} eval keys")
+    if args.num_shards > 1:
+        sel = sel[args.shard::args.num_shards]
     print(f"[calib] calib pool {len(pool)} keys ({len(excluded)} eval keys "
-          f"excluded), using {len(sel)}: {[fn[:-3] for fn, _ in sel]}", flush=True)
+          f"excluded), using {len(sel)} (shard {args.shard}/{args.num_shards}): "
+          f"{[fn[:-3] for fn, _ in sel]}", flush=True)
 
     def run_forward(_model, item):
         fn, ann = item
@@ -1788,6 +1791,21 @@ def _build_parser():
                         "own wrapper. Empty (default) = one table at "
                         "--output_json from --objective/--cross-layer-weight.")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--shard", type=int, default=0,
+                   help="Collect sigma on calibration samples [shard::num_shards] only "
+                        "(with --collect_out); merge the shards with --merge_from.")
+    p.add_argument("--num_shards", type=int, default=1)
+    p.add_argument("--collect_out", default="",
+                   help="Write the collected sigma records (+ metadata) to this file "
+                        "and exit without solving.")
+    p.add_argument("--merge_from", default="",
+                   help="Comma-separated --collect_out files: skip collection, merge "
+                        "the records, then solve + export as usual (CPU only).")
+    p.add_argument("--protect_out", default="",
+                   help="Select protected channels, write them to this JSON, exit.")
+    p.add_argument("--protect_in", default="",
+                   help="Use the protected channels from this JSON (a --protect_out "
+                        "file or any table's protected_channels) instead of selecting.")
     p.add_argument("--output_json", required=True)
     p.add_argument("--output_summary_csv", default=None)
     return p
@@ -1822,11 +1840,11 @@ def main():
             f"the same average independently, so W_g cannot move budget across "
             f"operators and would be silently ignored.")
 
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() and not args.merge_from:
         raise RuntimeError("Calibration requires CUDA (sc kernels are GPU-only).")
 
     torch.manual_seed(args.seed)
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed_all(args.seed)
 
     calib_on_sc = bool(args.calib_on_sc)
@@ -1835,6 +1853,214 @@ def main():
         1, int(round(args.budget_ratio * ref_sl)))
     if not args.attn_stoc_len:
         args.attn_stoc_len = calib_sc_sl
+
+    def solve():
+        # ---- solve + export, once per requested (objective, W_g) variant ----
+        # The sigma collection above is INDEPENDENT of the objective and of W_g:
+        # only the Lagrangian solve reads them. So N variants exported here share
+        # ONE sigma draw, which removes the calibration-sample noise (~0.33 pt on
+        # top-1 at n_calib=256, MP_REPORT.md) from any comparison between them —
+        # every difference is attributable to the objective alone. Independent
+        # calibrations per variant would confound the two.
+        variants = _parse_variants(args, calibrator)
+
+        snapshot = {k: list(rec["metrics"]) for k, rec in calibrator.records.items()}
+        out_root = Path(args.output_json)
+        out_root.parent.mkdir(parents=True, exist_ok=True)
+        written = []
+        for objective, clw in variants:
+            # Restore the as-collected amax metrics: select_dispatch_metrics()
+            # REBINDS rec["metrics"] to the chosen candidate, and the choice is
+            # objective-dependent, so each variant must start from the raw draw.
+            for k, metrics in snapshot.items():
+                calibrator.records[k]["metrics"] = list(metrics)
+            calibrator.objective = objective
+            calibrator.cross_layer_weight = clw
+            calibrator.dispatch_metric_selection = {}
+
+            tag = f"{objective}_w{clw}"
+            out_json = (out_root if len(variants) == 1
+                        else out_root.with_name(f"{out_root.stem}__{tag}.json"))
+            print(f"\n[calib] === variant objective={objective} W_g={clw} "
+                  f"-> {out_json.name} ===", flush=True)
+
+            rho = calibrator.metric_fidelity_rho()
+            print("[calib] metric-fidelity rho(metric, objective-benefit) per op "
+                  "(~1 good; low/neg => metric misranks -> headroom):")
+            for op in sorted(rho, key=lambda o: rho[o]["rho"]
+                             if rho[o]["rho"] == rho[o]["rho"] else 9):
+                d = rho[op]
+                print(f"    {op:<11} rho={d['rho']:+.3f}  n={d['n']:>8}  "
+                      f"benefit_mean={d['benefit_mean']:.4f}")
+
+            # act_global_v2: per-operator signed dispatch-metric selection. Rewrites
+            # the stored metric to the deployed candidate so thresholds build on it.
+            chosen = calibrator.select_dispatch_metrics()
+            if chosen:
+                print(f"[calib] metric-select auto -> switched metric on "
+                      f"{len(chosen)} op(s):")
+                for op in sorted(chosen):
+                    c = chosen[op]
+                    print(f"    {op:<11} metric={c['metric']:<5} "
+                          f"sign={c['sign']:+.0f} |rho|={c['rho_signed']:.3f} "
+                          f"(amax rho={c['rho_amax']:+.3f})")
+                rho_post = calibrator.metric_fidelity_rho()
+                print("[calib] post-selection rho(deployed metric, benefit):")
+                for op in sorted(rho_post, key=lambda o: rho_post[o]["rho"]
+                                 if rho_post[o]["rho"] == rho_post[o]["rho"] else 9):
+                    d = rho_post[op]
+                    print(f"    {op:<11} rho={d['rho']:+.3f}  n={d['n']:>8}")
+            elif calibrator.metric_select == "auto":
+                print("[calib] metric-select auto -> no op cleared the margin; "
+                      "keeping amax everywhere.")
+
+            payload, summary_rows = calibrator.export()
+            payload["metric_fidelity_rho"] = {op: rho[op]["rho"] for op in rho}
+            if chosen:
+                payload["dispatch_metrics"] = {
+                    op: {"metric": c["metric"], "sign": c["sign"]}
+                    for op, c in chosen.items()}
+            payload["task"] = "video_gen"
+            payload["model"] = "irasim_" + str(cfg.attention_mode)
+            payload["sc_prec"] = sc_prec
+            payload["halve_bipolar_stoc_len"] = halve
+            payload["operators"] = sorted(operators)
+            payload["n_calib_samples"] = args.n_calib_samples
+            payload["inference_steps"] = int(args.inference_steps)
+            payload["scheduler"] = args.scheduler
+            payload["record_every_k_steps"] = k_rec
+            payload["skip"] = {k: sorted(v) for k, v in skip_map.items() if v}
+            _sq = os.environ.get("SC_SMOOTH_SCALES")
+            payload["smoothquant_scales"] = os.path.abspath(_sq) if _sq else None
+            payload["total_blocks"] = int(total)
+            payload["seed"] = int(args.seed)
+            payload["calib_seed"] = int(args.calib_seed)
+            payload["eval_excluded"] = {"keys_file": args.eval_keys_file}
+            payload["calib_keys"] = calib_keys
+            payload["mp_levels"] = args.mp_levels
+            payload["chunk_d"] = int(args.chunk_d)
+            # Ops that consume budget but carry no MP table (see module docstring).
+            payload["uniform_ops"] = {op: int(args.attn_stoc_len)
+                                      for op in ("qk", "av")
+                                      if op not in operators}
+            method = "act_global" if args.budget_scope == "global" else "act"
+            if args.budget_weight == "macs":
+                method += "_fw"
+            if args.argmin_pricing == "macs":
+                method += "_kkt"
+            if clw != "uniform":
+                method += f"_w{clw}"
+            if objective != "sigma":
+                method += f"_{objective}"
+            if calib_on_sc:
+                method += "_onsc"
+                payload["calib_on_sc"] = True
+                payload["calib_sc_stoclen"] = calib_sc_sl
+            if args.group_ladder_k > 0:
+                method += f"_gl{args.group_ladder_k}"
+            if args.protect_channel_frac > 0.0:
+                method += f"_pc{args.protect_channel_frac:g}"
+            if args.escape_gate_k is not None:
+                method += f"_esc{args.escape_gate_k:g}"
+            if args.qk_granularity != "per_head":
+                method += f"_qk{args.qk_granularity}"
+            payload["qk_granularity"] = args.qk_granularity
+            payload["method"] = method
+            payload["calib_command"] = " ".join(sys.argv)
+            if len(variants) > 1:
+                # One sigma draw, many tables: say so in the bundle itself, so a
+                # cell can never be mistaken for an independent calibration.
+                payload["variant"] = {"tag": tag, "shared_sigma_draw": True,
+                                      "siblings": [f"{o}_w{c}" for o, c in variants]}
+
+            print(f"[calib] expected_avg_stoc_len (row-weighted) = "
+                  f"{payload['expected_avg_stoc_len']:.2f}")
+            print(f"[calib] expected_flop_avg_stoc_len (iso-compute check) = "
+                  f"{payload['expected_flop_avg_stoc_len']:.2f} "
+                  f"(target {args.budget_ratio * calibrator.budget_ref_stoc_len:.2f})")
+
+            with open(out_json, "w") as f:
+                json.dump(payload, f, indent=2)
+            print(f"[calib] wrote {out_json}")
+
+            # Deployment wrapper: what model.sc_vit.load_adaptive_mp() consumes.
+            # threshold_table_path is stored RELATIVE so a calibration bundle can be
+            # moved or copied between machines without rewriting it.
+            wrapper = out_json.with_name(out_json.stem + "_wrapper.json")
+            wrapper_spec = {
+                "type": "AdaptiveMPConfig",
+                "stoc_len_levels": levels,
+                "threshold_table_path": out_json.name,
+            }
+            if args.escape_gate_k is not None:
+                wrapper_spec["escape_gate_k"] = float(args.escape_gate_k)
+                wrapper_spec["escape_stoc_len"] = int(args.escape_stoc_len
+                                                      or max(levels))
+            with open(wrapper, "w") as f:
+                json.dump(wrapper_spec, f, indent=2)
+            print(f"[calib] wrote {wrapper}  <- pass this to --adaptive_mp_table")
+
+            summary_csv = (args.output_summary_csv if len(variants) == 1
+                           else None) or (str(out_json.with_suffix("")) + "_summary.csv")
+            _write_summary_csv(summary_csv, summary_rows)
+            print(f"[calib] wrote {summary_csv}")
+            written.append((tag, out_json, payload))
+
+        if len(written) > 1:
+            _print_variant_comparison(written, calibrator,
+                                      args.budget_ratio * calibrator.budget_ref_stoc_len)
+
+
+
+
+    # ---- merge mode: combine --collect_out shards, then solve (no GPU) -----
+    if args.merge_from:
+        import pickle
+        from types import SimpleNamespace
+        parts = [pickle.load(open(f, "rb")) for f in args.merge_from.split(",") if f]
+        meta = parts[0]["meta"]
+        for pt in parts[1:]:
+            for k in ("total", "layer_buckets", "levels", "skip_map", "attention_mode",
+                      "protected"):
+                if pt["meta"][k] != meta[k]:
+                    raise SystemExit(f"[merge] shards disagree on {k}")
+        total, skip_map = meta["total"], meta["skip_map"]
+        cfg = SimpleNamespace(attention_mode=meta["attention_mode"])
+        operators = set(meta["operators"])
+        calib_keys = [k for pt in parts for k in pt["meta"]["calib_keys"]]
+        k_rec = meta["k_rec"]
+        calibrator = ThresholdCalibrator(
+            levels=levels, operators=operators, total_blocks=total,
+            layer_buckets=meta["layer_buckets"], budget_ratio=args.budget_ratio,
+            budget_ref_stoc_len=args.budget_ref_stoc_len,
+            max_units_per_call=args.max_units_per_call,
+            min_bucket_units=args.min_bucket_units, rng_seed=args.seed,
+            budget_scope=args.budget_scope, budget_weight=args.budget_weight,
+            metric_select=args.metric_select,
+            metric_select_margin=args.metric_select_margin,
+            argmin_pricing=args.argmin_pricing, objective=args.objective,
+            cross_layer_weight=args.cross_layer_weight,
+            group_ladder_k=args.group_ladder_k, escape_gate_k=args.escape_gate_k,
+            escape_stoc_len=args.escape_stoc_len)
+        for k, v in meta["calib_attrs"].items():
+            setattr(calibrator, k, v)
+        for pt in parts:
+            for key, rec in pt["records"].items():
+                dst = calibrator.records[key]
+                dst["metrics"].extend(rec["metrics"])
+                dst["errors"].extend(rec["errors"])
+                for ak, av in rec["alts"].items():
+                    dst["alts"][ak].extend(av)
+            for key, v in pt["true_counts"].items():
+                calibrator.true_counts[key] += v
+            for key, v in pt["true_macs"].items():
+                calibrator.true_macs[key] += v
+            calibrator.chunk_unit_ops |= set(pt["meta"]["chunk_unit_ops"])
+        args.n_calib_samples = len(calib_keys)
+        print(f"[merge] {len(parts)} shards, {len(calib_keys)} calibration samples, "
+              f"{len(calibrator.records)} buckets", flush=True)
+        solve()
+        return
 
     # Build the SC model, then decide whether the forward TRAJECTORY is SC or
     # FP. The modules stay patched either way so the hooks still fire; only
@@ -1926,6 +2152,22 @@ def main():
                   f"{args.bucket_budget_from}; selection pre-pass skipped", flush=True)
         elif args.protect_channel_frac > 0:
             raise ValueError("bucket-budget-from reference has no protected channels; cannot add them")
+    elif args.protect_in:
+        prot = json.load(open(args.protect_in))
+        prot = prot.get("protected_channels", prot)
+        unpack = lambda vals: {(k.rsplit(":b", 1)[0], int(k.rsplit(":b", 1)[1])): v
+                               for k, v in vals.items()}
+        calibrator.protected_channel_indices = unpack(prot["indices"])
+        calibrator.protected_channel_dims = unpack(prot["dims"])
+        calibrator.protect_channel_frac = float(prot["frac"])
+        calibrator.protect_channel_stoc_len = int(prot["stoc_len"])
+        calibrator.protect_channel_metric = prot["metric"]
+        calibrator.protect_compensate_budget = bool(prot["compensate_budget"])
+        if abs(calibrator.protect_channel_frac - args.protect_channel_frac) > 1e-12:
+            raise SystemExit(f"[calib] --protect_in frac {calibrator.protect_channel_frac} "
+                             f"!= --protect-channel-frac {args.protect_channel_frac}")
+        print(f"[calib] protected channels from {args.protect_in}: "
+              f"{len(calibrator.protected_channel_indices)} modules", flush=True)
     elif args.protect_channel_frac > 0.0:
         prot_sl = int(args.protect_channel_stoc_len or max(levels))
         if prot_sl > max(levels):
@@ -1953,6 +2195,16 @@ def main():
               f"compensate={bool(args.protect_compensate_budget)} "
               f"[{time.time() - t_p:.0f}s]", flush=True)
         del stat_batches, act_scales
+        if args.protect_out:
+            json.dump({"frac": float(args.protect_channel_frac), "stoc_len": prot_sl,
+                       "metric": args.protect_channel_metric,
+                       "compensate_budget": bool(args.protect_compensate_budget),
+                       "indices": {f"{op}:b{b}": [int(i) for i in v]
+                                   for (op, b), v in sorted(idxs.items())},
+                       "dims": {f"{op}:b{b}": int(v) for (op, b), v in sorted(dims.items())}},
+                      open(args.protect_out, "w"), indent=1)
+            print(f"[calib] wrote {args.protect_out}", flush=True)
+            return
 
     calibrator.dispatch_unit = args.dispatch_unit
     calibrator.chunk_threshold_fit = args.chunk_threshold_fit
@@ -1994,162 +2246,32 @@ def main():
         for remove in hooks:
             remove()
 
-    # ---- solve + export, once per requested (objective, W_g) variant ----
-    # The sigma collection above is INDEPENDENT of the objective and of W_g:
-    # only the Lagrangian solve reads them. So N variants exported here share
-    # ONE sigma draw, which removes the calibration-sample noise (~0.33 pt on
-    # top-1 at n_calib=256, MP_REPORT.md) from any comparison between them —
-    # every difference is attributable to the objective alone. Independent
-    # calibrations per variant would confound the two.
-    variants = _parse_variants(args, calibrator)
+    if args.collect_out:
+        import pickle
+        meta = {"total": total, "layer_buckets": layer_buckets, "levels": levels,
+                "skip_map": {k: sorted(v) for k, v in skip_map.items()},
+                "attention_mode": str(cfg.attention_mode), "operators": sorted(operators),
+                "calib_keys": calib_keys, "k_rec": k_rec,
+                "chunk_unit_ops": sorted(calibrator.chunk_unit_ops),
+                "protected": sorted((f"{o}:b{b}", tuple(v)) for (o, b), v in
+                                    calibrator.protected_channel_indices.items()),
+                "calib_attrs": {k: getattr(calibrator, k) for k in (
+                    "n_heads", "protected_channel_indices", "protected_channel_dims",
+                    "protect_channel_frac", "protect_channel_stoc_len",
+                    "protect_channel_metric", "protect_compensate_budget",
+                    "dispatch_unit", "chunk_threshold_fit", "bucket_budget_ref")}}
+        recs = {k: {"metrics": v["metrics"], "errors": v["errors"], "alts": dict(v["alts"])}
+                for k, v in calibrator.records.items()}
+        Path(args.collect_out).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.collect_out, "wb") as f:
+            pickle.dump({"meta": meta, "records": recs,
+                         "true_counts": dict(calibrator.true_counts),
+                         "true_macs": dict(calibrator.true_macs)}, f, protocol=4)
+        print(f"[calib] wrote {args.collect_out} ({len(recs)} buckets, "
+              f"{len(calib_keys)} samples)", flush=True)
+        return
 
-    snapshot = {k: list(rec["metrics"]) for k, rec in calibrator.records.items()}
-    out_root = Path(args.output_json)
-    out_root.parent.mkdir(parents=True, exist_ok=True)
-    written = []
-    for objective, clw in variants:
-        # Restore the as-collected amax metrics: select_dispatch_metrics()
-        # REBINDS rec["metrics"] to the chosen candidate, and the choice is
-        # objective-dependent, so each variant must start from the raw draw.
-        for k, metrics in snapshot.items():
-            calibrator.records[k]["metrics"] = list(metrics)
-        calibrator.objective = objective
-        calibrator.cross_layer_weight = clw
-        calibrator.dispatch_metric_selection = {}
-
-        tag = f"{objective}_w{clw}"
-        out_json = (out_root if len(variants) == 1
-                    else out_root.with_name(f"{out_root.stem}__{tag}.json"))
-        print(f"\n[calib] === variant objective={objective} W_g={clw} "
-              f"-> {out_json.name} ===", flush=True)
-
-        rho = calibrator.metric_fidelity_rho()
-        print("[calib] metric-fidelity rho(metric, objective-benefit) per op "
-              "(~1 good; low/neg => metric misranks -> headroom):")
-        for op in sorted(rho, key=lambda o: rho[o]["rho"]
-                         if rho[o]["rho"] == rho[o]["rho"] else 9):
-            d = rho[op]
-            print(f"    {op:<11} rho={d['rho']:+.3f}  n={d['n']:>8}  "
-                  f"benefit_mean={d['benefit_mean']:.4f}")
-
-        # act_global_v2: per-operator signed dispatch-metric selection. Rewrites
-        # the stored metric to the deployed candidate so thresholds build on it.
-        chosen = calibrator.select_dispatch_metrics()
-        if chosen:
-            print(f"[calib] metric-select auto -> switched metric on "
-                  f"{len(chosen)} op(s):")
-            for op in sorted(chosen):
-                c = chosen[op]
-                print(f"    {op:<11} metric={c['metric']:<5} "
-                      f"sign={c['sign']:+.0f} |rho|={c['rho_signed']:.3f} "
-                      f"(amax rho={c['rho_amax']:+.3f})")
-            rho_post = calibrator.metric_fidelity_rho()
-            print("[calib] post-selection rho(deployed metric, benefit):")
-            for op in sorted(rho_post, key=lambda o: rho_post[o]["rho"]
-                             if rho_post[o]["rho"] == rho_post[o]["rho"] else 9):
-                d = rho_post[op]
-                print(f"    {op:<11} rho={d['rho']:+.3f}  n={d['n']:>8}")
-        elif calibrator.metric_select == "auto":
-            print("[calib] metric-select auto -> no op cleared the margin; "
-                  "keeping amax everywhere.")
-
-        payload, summary_rows = calibrator.export()
-        payload["metric_fidelity_rho"] = {op: rho[op]["rho"] for op in rho}
-        if chosen:
-            payload["dispatch_metrics"] = {
-                op: {"metric": c["metric"], "sign": c["sign"]}
-                for op, c in chosen.items()}
-        payload["task"] = "video_gen"
-        payload["model"] = "irasim_" + str(cfg.attention_mode)
-        payload["sc_prec"] = sc_prec
-        payload["halve_bipolar_stoc_len"] = halve
-        payload["operators"] = sorted(operators)
-        payload["n_calib_samples"] = args.n_calib_samples
-        payload["inference_steps"] = int(args.inference_steps)
-        payload["scheduler"] = args.scheduler
-        payload["record_every_k_steps"] = k_rec
-        payload["skip"] = {k: sorted(v) for k, v in skip_map.items() if v}
-        _sq = os.environ.get("SC_SMOOTH_SCALES")
-        payload["smoothquant_scales"] = os.path.abspath(_sq) if _sq else None
-        payload["total_blocks"] = int(total)
-        payload["seed"] = int(args.seed)
-        payload["calib_seed"] = int(args.calib_seed)
-        payload["eval_excluded"] = {"keys_file": args.eval_keys_file}
-        payload["calib_keys"] = calib_keys
-        payload["mp_levels"] = args.mp_levels
-        payload["chunk_d"] = int(args.chunk_d)
-        # Ops that consume budget but carry no MP table (see module docstring).
-        payload["uniform_ops"] = {op: int(args.attn_stoc_len)
-                                  for op in ("qk", "av")
-                                  if op not in operators}
-        method = "act_global" if args.budget_scope == "global" else "act"
-        if args.budget_weight == "macs":
-            method += "_fw"
-        if args.argmin_pricing == "macs":
-            method += "_kkt"
-        if clw != "uniform":
-            method += f"_w{clw}"
-        if objective != "sigma":
-            method += f"_{objective}"
-        if calib_on_sc:
-            method += "_onsc"
-            payload["calib_on_sc"] = True
-            payload["calib_sc_stoclen"] = calib_sc_sl
-        if args.group_ladder_k > 0:
-            method += f"_gl{args.group_ladder_k}"
-        if args.protect_channel_frac > 0.0:
-            method += f"_pc{args.protect_channel_frac:g}"
-        if args.escape_gate_k is not None:
-            method += f"_esc{args.escape_gate_k:g}"
-        if args.qk_granularity != "per_head":
-            method += f"_qk{args.qk_granularity}"
-        payload["qk_granularity"] = args.qk_granularity
-        payload["method"] = method
-        payload["calib_command"] = " ".join(sys.argv)
-        if len(variants) > 1:
-            # One sigma draw, many tables: say so in the bundle itself, so a
-            # cell can never be mistaken for an independent calibration.
-            payload["variant"] = {"tag": tag, "shared_sigma_draw": True,
-                                  "siblings": [f"{o}_w{c}" for o, c in variants]}
-
-        print(f"[calib] expected_avg_stoc_len (row-weighted) = "
-              f"{payload['expected_avg_stoc_len']:.2f}")
-        print(f"[calib] expected_flop_avg_stoc_len (iso-compute check) = "
-              f"{payload['expected_flop_avg_stoc_len']:.2f} "
-              f"(target {args.budget_ratio * calibrator.budget_ref_stoc_len:.2f})")
-
-        with open(out_json, "w") as f:
-            json.dump(payload, f, indent=2)
-        print(f"[calib] wrote {out_json}")
-
-        # Deployment wrapper: what model.sc_vit.load_adaptive_mp() consumes.
-        # threshold_table_path is stored RELATIVE so a calibration bundle can be
-        # moved or copied between machines without rewriting it.
-        wrapper = out_json.with_name(out_json.stem + "_wrapper.json")
-        wrapper_spec = {
-            "type": "AdaptiveMPConfig",
-            "stoc_len_levels": levels,
-            "threshold_table_path": out_json.name,
-        }
-        if args.escape_gate_k is not None:
-            wrapper_spec["escape_gate_k"] = float(args.escape_gate_k)
-            wrapper_spec["escape_stoc_len"] = int(args.escape_stoc_len
-                                                  or max(levels))
-        with open(wrapper, "w") as f:
-            json.dump(wrapper_spec, f, indent=2)
-        print(f"[calib] wrote {wrapper}  <- pass this to --adaptive_mp_table")
-
-        summary_csv = (args.output_summary_csv if len(variants) == 1
-                       else None) or (str(out_json.with_suffix("")) + "_summary.csv")
-        _write_summary_csv(summary_csv, summary_rows)
-        print(f"[calib] wrote {summary_csv}")
-        written.append((tag, out_json, payload))
-
-    if len(written) > 1:
-        _print_variant_comparison(written, calibrator,
-                                  args.budget_ratio * calibrator.budget_ref_stoc_len)
-
-
+    solve()
 
 
 def _parse_variants(args, calibrator) -> list:
