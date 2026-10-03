@@ -221,6 +221,8 @@ def main():
     p.add_argument("--int_bits", type=int, default=8)
     p.add_argument("--w_datatype", default="mixed_bitmod",
                    help="BitMoD weight datatype for --int_baseline bitmod")
+    p.add_argument("--save_latents", action="store_true",
+                   help="also save each sample's predicted latent to <out>/latents/<key>.pt")
     p.add_argument("--seed", type=int, default=0,
                    help="Initial-noise seed; each sample uses seed + crc32(key), "
                         "so arms are paired on identical noise.")
@@ -326,6 +328,9 @@ def main():
             sig = _rt.sigma_summary(clear=True) if _rt.measuring() else None
             dt = time.time() - t0
             pred_lat = pred_lat.squeeze(0)
+            if cli.save_latents:
+                os.makedirs(os.path.join(out_dir, "latents"), exist_ok=True)
+                torch.save(pred_lat.detach().float().cpu(), os.path.join(out_dir, "latents", f"{key}.pt"))
             l2 = F.mse_loss(pred_lat[1:], gt_lat[1:]).item()
 
             mp4_path = os.path.join(vid_dir, f"{key}.mp4")

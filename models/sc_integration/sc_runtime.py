@@ -360,6 +360,15 @@ _PR_SUFFIX_TO_OP = {"attn.qkv": "qkv_proj", "attn.proj": "out_proj",
 def _group_uniform_from_table(path: str) -> dict:
     with open(path) as f:
         t = json.load(f)
+    if "group_stoclen" in t:
+        # {"group_stoclen": {"<op>:b<block>": L, ...}} -- e2e-sensitivity
+        # allocations (evaluate/e2e_sensitivity.py) and single-group probes;
+        # groups not listed keep the run's uniform stream length.
+        m = {}
+        for k, v in t["group_stoclen"].items():
+            op, b = k.rsplit(":b", 1)
+            m[(op, int(b))] = int(v)
+        return m
     if "per_module_fractions" in t:
         # PR #4 PaYN block-Gamma file (results/mp_fractions_sc_g*.json): one
         # level per module ("blocks.<i>.attn.qkv" ...); ops absent from it
