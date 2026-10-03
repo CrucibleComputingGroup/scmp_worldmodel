@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 
 from scmp_kernels import sc_matmul
+from scmp_kernels import trace as sc_trace
 from scmp_kernels.mp import (
     adaptive_classify_rows,
     compute_row_metric,
@@ -105,6 +106,8 @@ def _sc_attn_op(op, a3, b3, granularity, sc_prec, stoc_len):
         hook(op, blk, a3, b3)
     if not rt.sc_enabled():
         return torch.matmul(a3, b3.transpose(-2, -1))
+    if sc_trace._ENABLED:
+        sc_trace.set_context(op, blk, None)
     gmap = rt.group_stoclen()
     cfg = rt.mp_cfg_for(op)
     if gmap is not None:

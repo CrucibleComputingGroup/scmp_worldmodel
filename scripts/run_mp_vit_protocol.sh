@@ -11,7 +11,8 @@
 #   CELLS="uni_32 mp_32" N=300 bash scripts/run_mp_vit_protocol.sh
 #   CELLS="fp int8 uni_128 uni_96 mp_96" LADDER=128,96,64,48,32,24,16 ...
 #
-# Cells: fp (FP model) | int<b> (legacy naive per-tensor symmetric WbAb) |
+# Cells: fp (FP model) | pair_<L> (per-(row, chunk) MP, budgets matched to mp_<L>)
+#         | int<b> (legacy naive per-tensor symmetric WbAb) |
 #        vint<b> (scmp_vit INT: W=A asym, per-row x 128 chunk, per-row attention) |
 #        bitmod<b>[_<dtype>] (BitMoD weights, default mixed_bitmod, g128 + INT8 act/attn) |
 #        uni_<L> (uniform SC, L halved cycles) | mp_<L> (calibrate + MP at budget L).
@@ -43,6 +44,7 @@ ev () { local tag=$1 cfg=$2; shift 2
   local extra=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do extra+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   echo "=== eval [$tag] n=$N shard=$SHARD/$NUM_SHARDS $(date +%T)"
+  [ -n "${TRACE_DIR:-}" ] && { mkdir -p "$TRACE_DIR"; extra+=(SC_MP_TRACE="$TRACE_DIR/${tag}_trace.json"); }
   env SC_HALVE=1 SC_PREC=8 "${extra[@]}" $PY -u evaluate/eval_local_n_samples.py \
     --config "$cfg" --skip "$SKIP" --tag "$tag" --keys_file "$KEYS" \
     --num_samples "$N" --shard "$SHARD" --num_shards "$NUM_SHARDS" \
@@ -76,6 +78,12 @@ for c in $CELLS; do
     mp_*)  b=${c#mp_}; [ "$b" -lt "${LADDER%%,*}" ] || { echo "[mp] $c: budget must be below the ladder top ${LADDER%%,*}"; continue; }
            calib "$c" "$LADDER" "$b" \
              && ev "${TAG_PREFIX}$c" "$CONFIG" SC_UNIFORM_STOC_LEN="$b" SC_MP_TABLE="$CAL/${c}_wrapper.json" ;;
-    *) echo "[mp] unknown cell $c (uni_<L> | mp_<L>)" ;;
+    # per-(row, chunk) MP (scmp_vit pair_*): chunk-unit calibration whose per-(op, block)
+    # budgets are matched to the per-row mp_<L> table (needs it calibrated first).
+    pair_*) b=${c#pair_}; calib "mp_$b" "$LADDER" "$b" \
+           && calib "$c" "$LADDER" "$b" --dispatch-unit chunk --bucket-budget-from "$CAL/mp_$b.json" \
+                    --max_units_per_call 8192 \
+           && ev "${TAG_PREFIX}$c" "$CONFIG" SC_UNIFORM_STOC_LEN="$b" SC_MP_TABLE="$CAL/${c}_wrapper.json" ;;
+    *) echo "[mp] unknown cell $c (uni_<L> | mp_<L> | pair_<L> | fp | int<b> | vint<b> | bitmod<b>)" ;;
   esac
 done

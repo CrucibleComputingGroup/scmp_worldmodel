@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from scmp_kernels import sc_matmul
+from scmp_kernels import trace as sc_trace
 from scmp_kernels.mp import (
     adaptive_classify_rows,
     compute_row_metric,
@@ -190,6 +191,8 @@ def sc_linear_forward(
     if not rt.sc_enabled() or x2.shape[0] == 0:
         y = F.linear(x2, w, bias)
         return y.reshape(*orig_shape[:-1], -1).to(x.dtype)
+    if sc_trace._ENABLED:
+        sc_trace.set_context(top, block_idx, None)
 
     gmap = rt.group_stoclen()
     cfg = rt.mp_cfg_for(top)
