@@ -66,7 +66,23 @@ def _batched_level_matmul(a3, b3, level_of_row, levels, *, sc_prec, out_dim):
         if gather_idx is None:
             continue
         a_sel = a3.gather(1, gather_idx.unsqueeze(-1).expand(-1, -1, K))
-        out_sel = _mm3(a_sel.contiguous(), b3, "per_row", sl, sc_prec)
+        # Padded slots are a batching artifact: keep this call out of the
+        # precision trace and record the VALID rows (scmp_vit d9ee44f).
+        tracing = sc_trace._ENABLED
+        if tracing:
+            sc_trace._ENABLED = False
+        try:
+            out_sel = _mm3(a_sel.contiguous(), b3, "per_row", sl, sc_prec)
+        finally:
+            if tracing:
+                sc_trace._ENABLED = True
+        if tracing:
+            halve = bool(rt.state()["halve"])
+            sc_trace.record_matmul(
+                rows=int(valid.sum().item()), d_in=int(K), d_out=int(out_dim), batch=1,
+                stoc_len=sl, sc_prec=sc_prec, mode="bipolar", granularity="per_row",
+                halve=halve, rng_levels=2 ** (sc_prec - 1) if halve else 2 ** sc_prec,
+                chunk_d=0, smoothed=False)
         dst = (slice_base + gather_idx).reshape(-1)
         vflat = valid.reshape(-1)
         out.reshape(BH * N, out_dim)[dst[vflat]] = out_sel.reshape(BH * M, out_dim)[vflat]
