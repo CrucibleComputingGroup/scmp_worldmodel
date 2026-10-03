@@ -353,9 +353,29 @@ def maybe_shuffle(metric):
     return metric[torch.randperm(metric.numel(), generator=g, device=metric.device)]
 
 
+_PR_SUFFIX_TO_OP = {"attn.qkv": "qkv_proj", "attn.proj": "out_proj",
+                    "mlp.fc1": "mlp_fc1", "mlp.fc2": "mlp_fc2"}
+
+
 def _group_uniform_from_table(path: str) -> dict:
     with open(path) as f:
         t = json.load(f)
+    if "per_module_fractions" in t:
+        # PR #4 PaYN block-Gamma file (results/mp_fractions_sc_g*.json): one
+        # level per module ("blocks.<i>.attn.qkv" ...); ops absent from it
+        # (qk / av) keep the run's uniform stream length.
+        import re
+        levels = t["stoc_len_levels"]
+        m = {}
+        for name, d in t["per_module_fractions"].items():
+            mb = re.search(r"blocks\.(\d+)\.(attn\.qkv|attn\.proj|mlp\.fc1|mlp\.fc2)$", name)
+            if mb is None:
+                continue
+            fr = d["level_fractions"]
+            if max(fr) < 0.999:
+                raise ValueError(f"{path}: {name} mixes levels {fr}; not a per-module table")
+            m[(_PR_SUFFIX_TO_OP[mb.group(2)], int(mb.group(1)))] = int(levels[fr.index(max(fr))])
+        return m
     n = int(t["total_blocks"])
     if int(t.get("layer_buckets", n)) != n:
         raise ValueError("SC_GROUP_UNIFORM_TABLE needs a per-block table (layer_buckets == total_blocks)")

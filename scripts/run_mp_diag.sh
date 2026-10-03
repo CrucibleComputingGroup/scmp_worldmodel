@@ -24,6 +24,11 @@ ev () { local tag=$1; shift
     --config "$CONFIG" --skip "$SKIP" --tag "$tag" --keys_file "$KEYS" \
     --num_samples "$N" --shard 0 --num_shards 1 --inference_steps "$STEPS" --scheduler "$SCHED"; }
 for c in ${CELLS:?}; do
+  case "$c" in   # PR #4 PaYN block-Gamma allocation (one level per module) in the aligned pipeline
+    g758) ev "${TAG_PREFIX}payn_96" SC_UNIFORM_STOC_LEN=96 SC_GROUP_UNIFORM_TABLE=results/mp_fractions_sc_g758.json; continue ;;
+    g658) ev "${TAG_PREFIX}payn_48" SC_UNIFORM_STOC_LEN=48 SC_GROUP_UNIFORM_TABLE=results/mp_fractions_sc_g658.json; continue ;;
+    g632) ev "${TAG_PREFIX}payn_40" SC_UNIFORM_STOC_LEN=40 SC_GROUP_UNIFORM_TABLE=results/mp_fractions_sc_g632.json; continue ;;
+  esac
   b=${c#*_}
   [ -f "$CAL/mp_$b.json" ] || { echo "[diag] $c: $CAL/mp_$b.json missing"; continue; }
   case "$c" in
