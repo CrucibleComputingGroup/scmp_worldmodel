@@ -314,6 +314,35 @@ _SHUFFLE = os.environ.get("SC_MP_SHUFFLE") == "1"
 _SHUFFLE_GEN: dict = {}
 
 
+# SC_MEASURE_SIGMA=1: for every SC call also compute the FP result and
+#   accumulate the MAC-weighted per-row relative L2 error per op -- the
+#   calibrator's sigma, measured at DEPLOYMENT (on the deployed trajectory).
+_MEASURE = os.environ.get("SC_MEASURE_SIGMA") == "1"
+_SIGMA = defaultdict(lambda: [0.0, 0.0])
+
+
+def measuring() -> bool:
+    return _MEASURE
+
+
+def record_sigma(op, sc_out, fp_out, macs_per_row):
+    s2 = sc_out.reshape(-1, sc_out.shape[-1]).float()
+    f2 = fp_out.reshape(-1, fp_out.shape[-1]).float()
+    rel = (s2 - f2).norm(dim=-1) / f2.norm(dim=-1).clamp_min(1e-8)
+    acc = _SIGMA[op]
+    acc[0] += float(rel.sum()) * float(macs_per_row)
+    acc[1] += float(rel.numel()) * float(macs_per_row)
+
+
+def sigma_summary(clear: bool = False) -> dict:
+    out = {op: (a[0] / a[1] if a[1] else 0.0) for op, a in sorted(_SIGMA.items())}
+    tn = sum(a[0] for a in _SIGMA.values()); td = sum(a[1] for a in _SIGMA.values())
+    out["ALL"] = tn / td if td else 0.0
+    if clear:
+        _SIGMA.clear()
+    return out
+
+
 def maybe_shuffle(metric):
     if not _SHUFFLE or metric.numel() < 2:
         return metric

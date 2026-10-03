@@ -209,4 +209,6 @@ def sc_linear_forward(
         rt.record_cost(top, x2.shape[0] * macs_per_row, sl)
     if bias is not None:
         y = y + bias
+    if rt.measuring():
+        rt.record_sigma(top, y, F.linear(x2, w, bias), macs_per_row)
     return y.reshape(*orig_shape[:-1], -1).to(x.dtype)

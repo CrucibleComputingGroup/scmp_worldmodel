@@ -322,6 +322,8 @@ def main():
             videos, pred_lat = gen_one(pipe, mask_x, actions, args, device,
                                        generator=sample_generator(key, cli.seed, device))
             cyc = cost_summary(clear=True)
+            from models.sc_integration import sc_runtime as _rt
+            sig = _rt.sigma_summary(clear=True) if _rt.measuring() else None
             dt = time.time() - t0
             pred_lat = pred_lat.squeeze(0)
             l2 = F.mse_loss(pred_lat[1:], gt_lat[1:]).item()
@@ -341,6 +343,8 @@ def main():
                 "avg_cycles_per_op": {k: round(v, 3) for k, v in cyc.items()
                                       if k not in ("ALL", "mac_share")},
             }
+            if sig is not None:
+                metric["deploy_sigma"] = {k: round(v, 5) for k, v in sig.items()}
             with open(os.path.join(met_dir, f"{key}.json"), "w") as f:
                 json.dump(metric, f)
             metrics.append(metric)

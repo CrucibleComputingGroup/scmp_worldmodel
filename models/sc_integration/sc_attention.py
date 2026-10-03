@@ -97,7 +97,7 @@ def _mp_rows(op, a3, b3, cfg, sc_prec, out_dim):
     return out
 
 
-def _sc_attn_op(op, a3, b3, granularity, sc_prec, stoc_len):
+def _sc_attn_op_impl(op, a3, b3, granularity, sc_prec, stoc_len):
     """``a3 @ b3.T`` for one attention op under the run's SC policy."""
     BH, N, K = a3.shape
     out_dim = b3.shape[1]
@@ -124,6 +124,14 @@ def _sc_attn_op(op, a3, b3, granularity, sc_prec, stoc_len):
     sl = rt.resolve_stoc_len(stoc_len, sc_prec)
     rt.record_cost(op, float(BH * N) * out_dim * K, sl)
     return _mm3(a3, b3, granularity, sl, sc_prec)
+
+
+def _sc_attn_op(op, a3, b3, granularity, sc_prec, stoc_len):
+    out = _sc_attn_op_impl(op, a3, b3, granularity, sc_prec, stoc_len)
+    if rt.measuring() and rt.sc_enabled():
+        rt.record_sigma(op, out, torch.matmul(a3, b3.transpose(-2, -1)),
+                        float(a3.shape[-1]) * float(b3.shape[1]))
+    return out
 
 
 def sc_qk_matmul(q_scaled: torch.Tensor, k: torch.Tensor,
