@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end sensitivity probes + evaluation for evaluate/e2e_sensitivity.py.
 #   MODE=probe SHARD=i NUM_SHARDS=n bash scripts/run_e2e_probe.sh   # fp + base + probes[i::n]
-#   MODE=eval  TARGETS="96 48 40"   bash scripts/run_e2e_probe.sh   # e2e_<T> on KEYS (diverse_10)
+#   MODE=val   TARGETS="96 48 40"   bash scripts/run_e2e_probe.sh   # candidates + uniform on val keys
+#   MODE=eval  TARGETS="96 48 40"   bash scripts/run_e2e_probe.sh   # selected e2e_<T> on KEYS (diverse_10)
 # Same protocol as run_mp_vit_protocol.sh (halve, sc_prec 8, SmoothQuant, recipe skip, seeded noise).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
@@ -33,6 +34,14 @@ if [ "$MODE" = probe ]; then
     [ $((i % NUM_SHARDS)) = "$SHARD" ] && run "e2e_$p" "$CONFIG" "$CK" "$NK" \
       SC_UNIFORM_STOC_LEN="$L0" SC_GROUP_UNIFORM_TABLE="$E2E/probes/$p.json"
     i=$((i + 1))
+  done
+elif [ "$MODE" = val ]; then
+  VK=$E2E/val_keys.json; NV=$($PY -c "import json;print(len(json.load(open('$VK'))))")
+  for T in ${TARGETS:?}; do
+    run "e2eval_uni_$T" "$CONFIG" "$VK" "$NV" SC_UNIFORM_STOC_LEN="$T"
+    for m in ${MOVES:-8 16 24}; do
+      run "e2eval_${T}_m$m" "$CONFIG" "$VK" "$NV" SC_UNIFORM_STOC_LEN="$T" SC_GROUP_UNIFORM_TABLE="$E2E/e2e_${T}_m$m.json"
+    done
   done
 else
   KEYS=${KEYS:-results/diverse_10.json}; N=${N:-10}

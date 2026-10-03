@@ -19,8 +19,15 @@ sensitive groups per MAC-cycle until the MAC-weighted budget is balanced.
 
   python evaluate/e2e_sensitivity.py plan    --out results/e2e --L0 48 --step 16
   (run the probes: scripts/run_e2e_probe.sh)
-  python evaluate/e2e_sensitivity.py collect --out results/e2e --mac_trace <uniform trace> \\
-         --targets 96,48,40
+  python evaluate/e2e_sensitivity.py collect --out results/e2e --mac_trace <uniform trace>
+  (MODE=val: candidates + uniform on the validation keys)
+  python evaluate/e2e_sensitivity.py select  --out results/e2e --eval_root <...>
+  (MODE=eval: the selected e2e_<T>.json on the test keys)
+
+Selection gate: uniform is a candidate and wins ties, so the deployed
+allocation is >= uniform on the validation keys by construction (MP contains
+uniform as a special case; the measured allocation only deviates from it when
+the end-to-end metric says so).
 """
 import argparse, glob, json, os, random
 from collections import defaultdict
@@ -44,14 +51,16 @@ def cmd_plan(a):
     pool = sorted(f[:-3] for f in os.listdir(gt) if f.endswith(".pt") and f[:-3] not in excl
                   and os.path.exists(os.path.join(ann, "_".join(f[:-3].split("_")[:-2]) + ".json")))
     random.Random(a.seed).shuffle(pool)
-    keys = []
+    ok = []
     for k in pool:
         eid, start = "_".join(k.split("_")[:-2]), int(k.split("_")[-1])
         if start + 16 <= len(json.load(open(os.path.join(ann, eid + ".json")))["state"]):
-            keys.append(k)
-        if len(keys) == a.n_keys:
+            ok.append(k)
+        if len(ok) == a.n_keys + a.n_val:
             break
+    keys, val = ok[:a.n_keys], ok[a.n_keys:]
     json.dump(keys, open(f"{a.out}/calib_keys.json", "w"))
+    json.dump(val, open(f"{a.out}/val_keys.json", "w"))
     names = []
     for op in OPS:
         for bi, bl in enumerate(buckets(a.n_blocks, a.n_buckets)):
@@ -62,9 +71,9 @@ def cmd_plan(a):
                       open(f"{a.out}/probes/{name}.json", "w"))
             names.append(name)
     json.dump({"L0": a.L0, "step": a.step, "n_blocks": a.n_blocks, "n_buckets": a.n_buckets,
-               "keys": keys, "probes": names, "seed": a.seed,
+               "keys": keys, "val_keys": val, "probes": names, "seed": a.seed,
                "exclude_keys": a.exclude_keys}, open(f"{a.out}/plan.json", "w"), indent=1)
-    print(f"{len(names)} probes, calib keys {keys}")
+    print(f"{len(names)} probes, calib keys {keys}, validation keys {val}")
 
 
 def _mse(x, y):
@@ -104,8 +113,9 @@ def cmd_collect(a):
                        "dL": sens[name], "s": sens[name] / (m * step)})
     tot = sum(g["macs"] for g in groups)
     report = {"L0": L0, "step": step, "base_mse": base, "groups": groups, "allocations": {}}
-    for T in [int(t) for t in a.targets.split(",")]:
-        st = a.move if a.move else (32 if T >= 96 else 16)
+    jobs = [(int(t), int(m)) for t in a.targets.split(",") for m in a.moves.split(",")]
+    for T, mv in jobs:
+        st = mv * (2 if T >= 96 else 1)
         lo, hi = max(8, T - st), min(128, T + st)
         L = {g["name"]: T for g in groups}
         order = sorted(groups, key=lambda g: g["s"])       # least sensitive first
@@ -142,18 +152,58 @@ def cmd_collect(a):
         table = {"group_stoclen": {f"{g['op']}:b{b}": L[g["name"]] for g in groups for b in g["blocks"]},
                  "target": T, "realized_mac_avg": cost(), "method": "e2e_knockdown_lp",
                  "probe_L0": L0, "probe_step": step, "move": st}
-        json.dump(table, open(f"{a.out}/e2e_{T}.json", "w"), indent=1)
-        report["allocations"][T] = {g["name"]: L[g["name"]] for g in groups}
-        report["allocations"][f"{T}_realized"] = cost()
+        json.dump(table, open(f"{a.out}/e2e_{T}_m{mv}.json", "w"), indent=1)
+        report["allocations"][f"{T}_m{mv}"] = {g["name"]: L[g["name"]] for g in groups}
+        report["allocations"][f"{T}_m{mv}_realized"] = cost()
     json.dump(report, open(f"{a.out}/report.json", "w"), indent=1)
     print(f"base MSE vs FP: {base}")
-    print(f"{'group':14s} {'MAC%':>6s} {'dL':>10s} {'dL/MACcyc':>10s}  " +
-          "  ".join(f"L@{t}" for t in a.targets.split(",")))
+    tags = [f"{T}_m{mv}" for T, mv in jobs]
+    print(f"{'group':14s} {'MAC%':>6s} {'dL':>10s} {'dL/MACcyc':>10s}  " + " ".join(f"{t:>8s}" for t in tags))
     for g in sorted(groups, key=lambda g: -g["s"]):
         print(f"{g['name']:14s} {g['macs']/tot*100:6.2f} {g['dL']:+10.3e} {g['s']:+10.3e}  " +
-              "  ".join(f"{report['allocations'][int(t)][g['name']]:4d}" for t in a.targets.split(",")))
-    for T in a.targets.split(","):
-        print(f"target {T}: realized MAC-avg {report['allocations'][f'{int(T)}_realized']:.2f}")
+              " ".join(f"{report['allocations'][t][g['name']]:8d}" for t in tags))
+    for t in tags:
+        print(f"candidate {t}: realized MAC-avg {report['allocations'][t + '_realized']:.2f}")
+
+
+def cmd_select(a):
+    """Pick, per target, the best of {uniform} U {e2e_<T>_m<move>} on the
+    VALIDATION keys (paired, seeded), by mean PSNR. Uniform wins ties, so the
+    deployed allocation is never worse than uniform on validation by construction."""
+    import shutil
+    plan = json.load(open(f"{a.out}/plan.json"))
+    vk = plan["val_keys"]
+
+    def psnr(tag):
+        v = []
+        for k in vk:
+            p = f"{a.eval_root}/{tag}/metrics/{k}.json"
+            if not os.path.exists(p):
+                return None
+            v.append(json.load(open(p))["psnr"])
+        return sum(v) / len(v)
+
+    out = {}
+    for T in [int(t) for t in a.targets.split(",")]:
+        uni = psnr(f"e2eval_uni_{T}")
+        best, best_p = "uniform", uni
+        cands = {}
+        for m in a.moves.split(","):
+            pv = psnr(f"e2eval_{T}_m{m}")
+            cands[f"m{m}"] = pv
+            if pv is not None and uni is not None and pv > best_p + a.margin:
+                best, best_p = f"m{m}", pv
+        out[T] = {"uniform": uni, **cands, "selected": best}
+        dst = f"{a.out}/e2e_{T}.json"
+        if best == "uniform":
+            json.dump({"group_stoclen": {}, "target": T, "selected": "uniform",
+                       "validation_psnr": out[T]}, open(dst, "w"), indent=1)
+        else:
+            t = json.load(open(f"{a.out}/e2e_{T}_{best}.json"))
+            t["selected"] = best; t["validation_psnr"] = out[T]
+            json.dump(t, open(dst, "w"), indent=1)
+        print(f"T={T}: " + "  ".join(f"{k}={round(v, 3) if isinstance(v, float) else v}" for k, v in out[T].items()))
+    json.dump(out, open(f"{a.out}/selection.json", "w"), indent=1)
 
 
 def main():
@@ -163,14 +213,20 @@ def main():
     p.add_argument("--out", default="results/e2e"); p.add_argument("--L0", type=int, default=48)
     p.add_argument("--step", type=int, default=16); p.add_argument("--n_blocks", type=int, default=28)
     p.add_argument("--n_buckets", type=int, default=4); p.add_argument("--n_keys", type=int, default=3)
+    p.add_argument("--n_val", type=int, default=4)
     p.add_argument("--seed", type=int, default=4321)
     p.add_argument("--exclude_keys", default="results/diverse_300.json")
     c = sub.add_parser("collect")
     c.add_argument("--out", default="results/e2e"); c.add_argument("--eval_root", required=True)
     c.add_argument("--mac_trace", required=True); c.add_argument("--targets", default="96,48,40")
-    c.add_argument("--move", type=int, default=0, help="trust region +-cycles (0: 16, 32 for T>=96)")
+    c.add_argument("--moves", default="8,16,24",
+                   help="trust-region sizes (+-cycles; doubled for T>=96), one candidate each")
+    v = sub.add_parser("select")
+    v.add_argument("--out", default="results/e2e"); v.add_argument("--eval_root", required=True)
+    v.add_argument("--targets", default="96,48,40"); v.add_argument("--moves", default="8,16,24")
+    v.add_argument("--margin", type=float, default=0.0)
     a = ap.parse_args()
-    {"plan": cmd_plan, "collect": cmd_collect}[a.cmd](a)
+    {"plan": cmd_plan, "collect": cmd_collect, "select": cmd_select}[a.cmd](a)
 
 
 if __name__ == "__main__":
