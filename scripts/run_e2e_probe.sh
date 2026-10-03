@@ -2,6 +2,7 @@
 # End-to-end sensitivity probes + evaluation for evaluate/e2e_sensitivity.py.
 #   MODE=probe SHARD=i NUM_SHARDS=n bash scripts/run_e2e_probe.sh   # fp + base + probes[i::n]
 #   MODE=val   TARGETS="96 48 40"   bash scripts/run_e2e_probe.sh   # candidates + uniform on val keys
+#   MODE=tprobe SHARD=i NUM_SHARDS=n / MODE=tval TARGETS="96 48 40"   # timestep axis (results/e2t)
 #   MODE=eval  TARGETS="96 48 40"   bash scripts/run_e2e_probe.sh   # selected e2e_<T> on KEYS (diverse_10)
 # Same protocol as run_mp_vit_protocol.sh (halve, sc_prec 8, SmoothQuant, recipe skip, seeded noise).
 set -uo pipefail
@@ -34,6 +35,24 @@ if [ "$MODE" = probe ]; then
     [ $((i % NUM_SHARDS)) = "$SHARD" ] && run "e2e_$p" "$CONFIG" "$CK" "$NK" \
       SC_UNIFORM_STOC_LEN="$L0" SC_GROUP_UNIFORM_TABLE="$E2E/probes/$p.json"
     i=$((i + 1))
+  done
+elif [ "$MODE" = tprobe ]; then          # timestep-window probes (evaluate/timestep_sensitivity.py)
+  E2T=${E2T:-results/e2t}
+  CK=$E2E/calib_keys.json; NK=$($PY -c "import json;print(len(json.load(open('$CK'))))")
+  SHARD=${SHARD:-0}; NUM_SHARDS=${NUM_SHARDS:-1}; i=0
+  for p in $($PY -c "import json;print(' '.join(json.load(open('$E2T/plan.json'))['probes']))"); do
+    S=$($PY -c "import json;print(json.dumps(json.load(open('$E2T/plan.json'))['probes']['$p'],separators=(',',':')))")
+    [ $((i % NUM_SHARDS)) = "$SHARD" ] && run "e2t_$p" "$CONFIG" "$CK" "$NK" SC_STEP_SCHEDULE="$S"
+    i=$((i + 1))
+  done
+elif [ "$MODE" = tval ]; then            # timestep candidates on the validation keys
+  E2T=${E2T:-results/e2t}
+  VK=$E2E/val_keys.json; NV=$($PY -c "import json;print(len(json.load(open('$VK'))))")
+  for T in ${TARGETS:?}; do
+    for m in ${MOVES:-8 16 24}; do
+      S=$($PY -c "import json;print(json.dumps(json.load(open('$E2T/sched_${T}_m$m.json')),separators=(',',':')))")
+      run "e2tval_${T}_m$m" "$CONFIG" "$VK" "$NV" SC_STEP_SCHEDULE="$S"
+    done
   done
 elif [ "$MODE" = val ]; then
   VK=$E2E/val_keys.json; NV=$($PY -c "import json;print(len(json.load(open('$VK'))))")
