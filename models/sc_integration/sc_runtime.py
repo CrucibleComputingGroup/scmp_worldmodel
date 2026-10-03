@@ -303,6 +303,40 @@ def load_mp_table(path: str, ops=None) -> AdaptiveMPConfig:
     return cfg
 
 
+# ---- diagnostics (not part of the scmp_vit protocol) -----------------------
+# SC_MP_SHUFFLE=1: randomly permute the dispatch metric across the rows of each
+#   MP call -- same per-call metric distribution (so the same rung fractions),
+#   random ranking. Separates "the ranking signal" from "mixing rungs at all".
+# SC_GROUP_UNIFORM_TABLE=<table.json>: no row dispatch; every (op, block) runs
+#   uniform at its bucket's calibrated avg_stoc_len (cross-layer allocation
+#   only, protected channels off).
+_SHUFFLE = os.environ.get("SC_MP_SHUFFLE") == "1"
+_SHUFFLE_GEN: dict = {}
+
+
+def maybe_shuffle(metric):
+    if not _SHUFFLE or metric.numel() < 2:
+        return metric
+    import torch
+    g = _SHUFFLE_GEN.get(metric.device)
+    if g is None:
+        g = _SHUFFLE_GEN[metric.device] = torch.Generator(device=metric.device).manual_seed(0)
+    return metric[torch.randperm(metric.numel(), generator=g, device=metric.device)]
+
+
+def _group_uniform_from_table(path: str) -> dict:
+    with open(path) as f:
+        t = json.load(f)
+    n = int(t["total_blocks"])
+    if int(t.get("layer_buckets", n)) != n:
+        raise ValueError("SC_GROUP_UNIFORM_TABLE needs a per-block table (layer_buckets == total_blocks)")
+    m = {}
+    for key, b in t["buckets"].items():
+        op, _t, lb = key.split(":")
+        m[(op, int(lb[1:]))] = max(1, int(round(float(b["avg_stoc_len"]))))
+    return m
+
+
 def mp_cfg_for(table_op: str):
     if _STATE["mp_cfg"] is not None and table_op in _STATE["mp_ops"]:
         return _STATE["mp_cfg"]
@@ -320,6 +354,15 @@ def configure_from_env(model=None, verbose: bool = True) -> dict:
                 raise ValueError(f"MP table has total_blocks="
                                  f"{_STATE['total_blocks']} but model has {n}")
             _STATE["total_blocks"] = n
+    gtab = os.environ.get("SC_GROUP_UNIFORM_TABLE")
+    if gtab:
+        if os.environ.get("SC_MP_TABLE"):
+            raise ValueError("SC_GROUP_UNIFORM_TABLE and SC_MP_TABLE are exclusive")
+        set_group_stoclen(_group_uniform_from_table(gtab))
+        if verbose:
+            print(f"[sc] DIAG group-uniform from {gtab}: {len(group_stoclen())} (op, block) groups", flush=True)
+    if _SHUFFLE and verbose:
+        print("[sc] DIAG SC_MP_SHUFFLE=1: MP row ranking randomized", flush=True)
     table = os.environ.get("SC_MP_TABLE")
     if table:
         ops = [o.strip() for o in os.environ.get("SC_MP_OPS", "").split(",") if o.strip()]

@@ -79,7 +79,7 @@ def _mp_rows(op, a3, b3, cfg, sc_prec, out_dim):
     blk = get_current_block_idx()
     tb = rt.state()["total_blocks"]
     name, sign = cfg.get_dispatch_metric(op)
-    metric = compute_row_metric(a3.reshape(BH * N, K), name) * sign
+    metric = rt.maybe_shuffle(compute_row_metric(a3.reshape(BH * N, K), name) * sign)
     assignment = adaptive_classify_rows(metric, cfg, operator=op, block_idx=blk,
                                         total_blocks=tb, timestep=0, total_timesteps=1)
     levels = cfg.classify_level_values(operator=op, block_idx=blk, total_blocks=tb,

@@ -135,7 +135,7 @@ def _forward_row_mp(x2, w, op, block_idx, cfg, sc_prec):
                     actual += (int(cnt[r]) / n_ch) * macs_per_row * rest_scale * sl
         else:
             name, sign = cfg.get_dispatch_metric(op)
-            metric = compute_row_metric(x_disp, name) * sign
+            metric = rt.maybe_shuffle(compute_row_metric(x_disp, name) * sign)
             assignment = adaptive_classify_rows(
                 metric, cfg, operator=op, block_idx=block_idx, total_blocks=tb,
                 timestep=0, total_timesteps=1)
