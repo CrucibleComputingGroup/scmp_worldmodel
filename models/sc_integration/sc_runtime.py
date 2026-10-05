@@ -311,6 +311,14 @@ def load_mp_table(path: str, ops=None) -> AdaptiveMPConfig:
 #   uniform at its bucket's calibrated avg_stoc_len (cross-layer allocation
 #   only, protected channels off).
 _SHUFFLE = os.environ.get("SC_MP_SHUFFLE") == "1"
+# SC_MP_PROTECT_ONLY=<L>: DIAG -- keep the table's protected input channels (at its
+# protected length) but run every linear's residual columns UNIFORM at L, no row/chunk
+# dispatch. Isolates the protected-channel axis from the allocation axis.
+_PROTECT_ONLY = int(os.environ.get("SC_MP_PROTECT_ONLY") or 0)
+
+
+def protect_only_len() -> int:
+    return _PROTECT_ONLY
 _SHUFFLE_GEN: dict = {}
 
 
@@ -421,6 +429,9 @@ def configure_from_env(model=None, verbose: bool = True) -> dict:
             print(f"[sc] DIAG group-uniform from {gtab}: {len(group_stoclen())} (op, block) groups", flush=True)
     if _SHUFFLE and verbose:
         print("[sc] DIAG SC_MP_SHUFFLE=1: MP row ranking randomized", flush=True)
+    if _PROTECT_ONLY and verbose:
+        print(f"[sc] DIAG SC_MP_PROTECT_ONLY={_PROTECT_ONLY}: protected channels kept, "
+              f"residual uniform", flush=True)
     table = os.environ.get("SC_MP_TABLE")
     if table:
         ops = [o.strip() for o in os.environ.get("SC_MP_OPS", "").split(",") if o.strip()]

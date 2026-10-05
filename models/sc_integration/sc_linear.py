@@ -117,7 +117,11 @@ def _forward_row_mp(x2, w, op, block_idx, cfg, sc_prec):
     else:
         x_disp, w_disp = x2, w
 
-    if rest_scale > 0.0 and x_disp.shape[1] > 0:
+    if rest_scale > 0.0 and x_disp.shape[1] > 0 and rt.protect_only_len():
+        sl = rt.protect_only_len()            # DIAG: protection without allocation
+        actual += x2.shape[0] * macs_per_row * rest_scale * sl
+        y += _mm(x_disp, w_disp, sl, sc_prec)
+    elif rest_scale > 0.0 and x_disp.shape[1] > 0:
         if prc is not None:
             cd = rt.state()["chunk_d"]
             if not (cd > 0 and x_disp.shape[1] > cd):
