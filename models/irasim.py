@@ -86,28 +86,30 @@ class Attention(nn.Module):
                 sc_qk_matmul, sc_av_matmul, sc_linear_forward,
                 configure, is_op_enabled,
             )
+            from scmp_kernels.mp import set_current_block_idx
             configure(self.attention_mode)  # idempotent
             b = self.block_idx
+            set_current_block_idx(b)  # MP lookup / cost accounting for qk, av
 
-            qkv_out = sc_linear_forward(x, self.qkv) if is_op_enabled("qkv", b) else self.qkv(x)
+            qkv_out = sc_linear_forward(x, self.qkv, op="qkv", block_idx=b) if is_op_enabled("qkv", b) else self.qkv(x)
             qkv = qkv_out.reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
             q, k, v = qkv.unbind(0)
             q_scaled = q * self.scale
 
             if is_op_enabled("qk", b):
-                attn = sc_qk_matmul(q_scaled, k, sc_prec=8)
+                attn = sc_qk_matmul(q_scaled, k)
             else:
                 attn = q_scaled @ k.transpose(-2, -1)
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
 
             if is_op_enabled("av", b):
-                x = sc_av_matmul(attn, v, sc_prec=8).transpose(1, 2).reshape(B, N, C)
+                x = sc_av_matmul(attn, v).transpose(1, 2).reshape(B, N, C)
             else:
                 x = (attn @ v).transpose(1, 2).reshape(B, N, C)
 
             if is_op_enabled("proj", b):
-                x = sc_linear_forward(x, self.proj)
+                x = sc_linear_forward(x, self.proj, op="proj", block_idx=b)
                 x = self.proj_drop(x)
                 return x
             # fall through to standard proj below

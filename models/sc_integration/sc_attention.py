@@ -1,197 +1,177 @@
-"""Int8 SC QK matmul for IRASim attention.
+"""Bipolar SC attention matmuls (Q·Kᵀ and softmax·V) — scmp_vit port.
 
-Only the Q @ K^T step is replaced. Softmax, dropout, attn @ V, and projections
-remain FP32. The kernel is imported from the shared scmp_llm SC library.
+Mirrors ``scmp_vit/model/sc_vit.py``'s ``_sc_qk`` / ``_sc_av``:
+
+* Q·Kᵀ at ``sc_runtime`` ``qk_granularity`` (``per_row`` by default — each
+  query row its own range, which is what makes per-row MP exact; ``per_head``
+  is the legacy scope).
+* attn·V at ``per_row``, one batched call for all (B, H).
+* Both run at the run's uniform stream length (the same one the linears use),
+  or dispatch per row through the calibrated table when ``qk`` / ``av`` are MP
+  ops. The MP metric is pooled GLOBALLY over B*H*N rows, as the calibrator
+  records it.
+
+The block index comes from ``scmp_kernels.mp.set_current_block_idx`` (set by
+IRASim's Attention before the calls), so the public signatures stay what the
+naive-int8 baseline patches over.
 """
 from __future__ import annotations
 
 import torch
 
-import triton
-
-from sc_triton import (
-    sc_matmul_enable_batched_bipolar,
-    sc_matmul_enable_triton,
-    fused_quant_bipolar_batched_kernel,
-    enable_matmul_bipolar_batched_kernel,
-    _get_cached_sequences,
-    _get_cached_enable_tables,
-    _COMPACT_ENABLE_THRESHOLD_BYTES,
+from scmp_kernels import sc_matmul
+from scmp_kernels import trace as sc_trace
+from scmp_kernels.mp import (
+    adaptive_classify_rows,
+    compute_row_metric,
+    get_current_block_idx,
+    AutoMPBudgetLogger,
 )
-from config_helpers import make_sobol_simple_config
 
-_CONFIG_CACHE: dict[tuple[int, int], dict] = {}
-
-
-def _get_config(head_dim: int, sc_prec: int) -> dict:
-    key = (head_dim, sc_prec)
-    cfg = _CONFIG_CACHE.get(key)
-    if cfg is None:
-        cfg = make_sobol_simple_config(head_dim, head_dim, sc_prec)
-        _CONFIG_CACHE[key] = cfg
-    return cfg
+from . import sc_runtime as rt
 
 
-def sc_qk_matmul(
-    q_scaled: torch.Tensor,
-    k: torch.Tensor,
-    sc_prec: int = 8,
-    stoc_len: int | None = None,
-) -> torch.Tensor:
-    """Bipolar int8 SC QK matmul.
+def _mm3(a3, b3, granularity, sl, sc_prec):
+    return sc_matmul(a3, b3, granularity=granularity, mode="bipolar",
+                     sc_prec=sc_prec, group_a=1, group_b=1, stoc_len=int(sl),
+                     halve_bipolar_stoc_len=rt.state()["halve"])
 
-    Args:
-        q_scaled: (B, H, N, D) — Q already multiplied by 1/sqrt(D).
-        k:        (B, H, N, D)
-        sc_prec:  SC bit precision (8 ⇒ int8).
-        stoc_len: Stochastic stream length. Defaults to 2**sc_prec.
 
-    Returns:
-        (B, H, N, N) float32 attention logits.
+def _padded_level_gather(level_of_row, sl, BH, N):
+    mask = (level_of_row == sl).reshape(BH, N)
+    counts = mask.sum(dim=1)
+    M = int(counts.max().item())
+    if M == 0:
+        return None, None, 0
+    order = torch.argsort(mask.to(torch.int8), dim=1, descending=True, stable=True)
+    gather_idx = order[:, :M].contiguous()
+    ar = torch.arange(M, device=level_of_row.device).unsqueeze(0)
+    valid = ar < counts.unsqueeze(1)
+    first = gather_idx[:, :1].expand(-1, M)
+    gather_idx = torch.where(valid, gather_idx, first)
+    return gather_idx, valid, M
+
+
+def _batched_level_matmul(a3, b3, level_of_row, levels, *, sc_prec, out_dim):
+    """Per-row MP over a 3D batch, one batched per_row call per rung."""
+    BH, N, K = a3.shape
+    out = torch.zeros(BH, N, out_dim, dtype=torch.float32, device=a3.device)
+    row_cycles = 0.0
+    slice_base = torch.arange(BH, device=a3.device).unsqueeze(1) * N
+    for sl in levels:
+        sl = int(sl)
+        if sl <= 0:
+            continue
+        gather_idx, valid, M = _padded_level_gather(level_of_row, sl, BH, N)
+        if gather_idx is None:
+            continue
+        a_sel = a3.gather(1, gather_idx.unsqueeze(-1).expand(-1, -1, K))
+        # Padded slots are a batching artifact: keep this call out of the
+        # precision trace and record the VALID rows (scmp_vit d9ee44f).
+        tracing = sc_trace._ENABLED
+        if tracing:
+            sc_trace._ENABLED = False
+        try:
+            out_sel = _mm3(a_sel.contiguous(), b3, "per_row", sl, sc_prec)
+        finally:
+            if tracing:
+                sc_trace._ENABLED = True
+        if tracing:
+            halve = bool(rt.state()["halve"])
+            sc_trace.record_matmul(
+                rows=int(valid.sum().item()), d_in=int(K), d_out=int(out_dim), batch=1,
+                stoc_len=sl, sc_prec=sc_prec, mode="bipolar", granularity="per_row",
+                halve=halve, rng_levels=2 ** (sc_prec - 1) if halve else 2 ** sc_prec,
+                chunk_d=0, smoothed=False)
+        dst = (slice_base + gather_idx).reshape(-1)
+        vflat = valid.reshape(-1)
+        out.reshape(BH * N, out_dim)[dst[vflat]] = out_sel.reshape(BH * M, out_dim)[vflat]
+        row_cycles += float(int(valid.sum().item()) * sl)
+    return out, row_cycles
+
+
+def _mp_rows(op, a3, b3, cfg, sc_prec, out_dim):
+    BH, N, K = a3.shape
+    blk = get_current_block_idx()
+    tb = rt.state()["total_blocks"]
+    name, sign = cfg.get_dispatch_metric(op)
+    metric = rt.maybe_shuffle(compute_row_metric(a3.reshape(BH * N, K), name) * sign)
+    assignment = adaptive_classify_rows(metric, cfg, operator=op, block_idx=blk,
+                                        total_blocks=tb, timestep=0, total_timesteps=1)
+    levels = cfg.classify_level_values(operator=op, block_idx=blk, total_blocks=tb,
+                                       timestep=0, total_timesteps=1)
+    lv = torch.zeros(BH * N, dtype=torch.long, device=a3.device)
+    for sl, rows in assignment.level_row_indices.items():
+        if rows.numel():
+            lv[rows] = int(sl)
+    out, row_cycles = _batched_level_matmul(a3, b3, lv, levels, sc_prec=sc_prec,
+                                            out_dim=out_dim)
+    max_sl = max(int(s) for s in levels)
+    AutoMPBudgetLogger.record(blk, op, float(BH * N) * out_dim * K * max_sl,
+                              row_cycles * out_dim * K)
+    rt.record_cost(op, float(BH * N) * out_dim * K, row_cycles / max(BH * N, 1))
+    return out
+
+
+def _sc_attn_op_impl(op, a3, b3, granularity, sc_prec, stoc_len):
+    """``a3 @ b3.T`` for one attention op under the run's SC policy."""
+    BH, N, K = a3.shape
+    out_dim = b3.shape[1]
+    blk = get_current_block_idx()
+    for hook in rt.attn_hooks():
+        hook(op, blk, a3, b3)
+    if not rt.sc_enabled():
+        return torch.matmul(a3, b3.transpose(-2, -1))
+    if sc_trace._ENABLED:
+        sc_trace.set_context(op, blk, None)
+    gmap = rt.group_stoclen()
+    cfg = rt.mp_cfg_for(op)
+    if gmap is not None:
+        sl = int(gmap.get((op, blk), rt.resolve_stoc_len(stoc_len, sc_prec)))
+        rt.record_cost(op, float(BH * N) * out_dim * K, max(sl, 0))
+        if sl <= 0:
+            return torch.zeros(BH, N, out_dim, device=a3.device)
+        return _mm3(a3, b3, granularity, sl, sc_prec)
+    if cfg is not None:
+        if granularity != "per_row":
+            raise ValueError(f"{op} MP needs per_row granularity (got {granularity}); "
+                             f"calibrate and deploy qk at per_row")
+        return _mp_rows(op, a3, b3, cfg, sc_prec, out_dim)
+    sl = rt.resolve_stoc_len(stoc_len, sc_prec)
+    rt.record_cost(op, float(BH * N) * out_dim * K, sl)
+    return _mm3(a3, b3, granularity, sl, sc_prec)
+
+
+def _sc_attn_op(op, a3, b3, granularity, sc_prec, stoc_len):
+    out = _sc_attn_op_impl(op, a3, b3, granularity, sc_prec, stoc_len)
+    if rt.measuring() and rt.sc_enabled():
+        rt.record_sigma(op, out, torch.matmul(a3, b3.transpose(-2, -1)),
+                        float(a3.shape[-1]) * float(b3.shape[1]))
+    return out
+
+
+def sc_qk_matmul(q_scaled: torch.Tensor, k: torch.Tensor,
+                 sc_prec: int | None = None, stoc_len: int | None = None) -> torch.Tensor:
+    """SC Q·Kᵀ. ``q_scaled``/``k``: (B, H, N, D) -> (B, H, N, N) logits.
+
+    Pre-scaling Q by 1/sqrt(D) does not change any SC result: per_row and
+    per_head ranges scale with it, so the quantized integers are identical.
     """
     B, H, N, D = q_scaled.shape
-    if stoc_len is None:
-        stoc_len = 2 ** sc_prec
-    config = _get_config(D, sc_prec)
-
-    q_flat = q_scaled.reshape(B * H, N, D).float().contiguous()
-    k_flat = k.reshape(B * H, N, D).float().contiguous()
-
-    q_maxs = q_flat.amax(dim=(1, 2))
-    q_mins = q_flat.amin(dim=(1, 2))
-    k_maxs = k_flat.amax(dim=(1, 2))
-    k_mins = k_flat.amin(dim=(1, 2))
-
-    out = sc_matmul_enable_batched_bipolar(
-        q_flat, k_flat,
-        q_maxs, q_mins, k_maxs, k_mins,
-        sc_prec, config, stoc_len=stoc_len,
-    )
+    sc_prec = rt.state()["sc_prec"] if sc_prec is None else int(sc_prec)
+    qf = q_scaled.float().reshape(B * H, N, D).contiguous()
+    kf = k.float().reshape(B * H, N, D).contiguous()
+    out = _sc_attn_op("qk", qf, kf, rt.state()["qk_granularity"], sc_prec, stoc_len)
     return out.reshape(B, H, N, N).to(q_scaled.dtype)
 
 
-def _sc_matmul_enable_batched_bipolar_nm(
-    a_flat: torch.Tensor,     # (BH, N, K)
-    b_flat: torch.Tensor,     # (BH, M, K)
-    a_maxs: torch.Tensor,     # (BH,)
-    a_mins: torch.Tensor,
-    b_maxs: torch.Tensor,
-    b_mins: torch.Tensor,
-    sc_prec: int,
-    config: dict,
-    stoc_len: int,
-) -> torch.Tensor:
-    """BH-batched bipolar int8 SC matmul with N != M.
-
-    Structurally identical to sc_matmul_enable_batched_bipolar but does not
-    hard-code M = N (that version is QK-only). Output: (BH, N, M).
-    """
-    a_flat = a_flat.contiguous()
-    b_flat = b_flat.contiguous()
-    BH, N, K = a_flat.shape
-    M = b_flat.shape[1]
-    assert b_flat.shape[2] == K and b_flat.shape[0] == BH
-    device = a_flat.device
-
-    q_max = 2 ** (sc_prec - 1) - 1
-    q_min = -(2 ** (sc_prec - 1))
-    max_rng_val = 2 ** sc_prec
-    q_max_sq = float(q_max * q_max)
-
-    abs_max_a = torch.maximum(a_maxs.abs(), a_mins.abs()).clamp(min=1e-5)
-    abs_max_b = torch.maximum(b_maxs.abs(), b_mins.abs()).clamp(min=1e-5)
-    scale_a = abs_max_a / q_max
-    scale_b = abs_max_b / q_max
-    inv_scale_a = 1.0 / scale_a
-    inv_scale_b = 1.0 / scale_b
-
-    # Quantize a and b — note the quant kernel writes transposed (BH, K, N/M).
-    boundary_a = torch.empty(BH, K, N, dtype=torch.int16, device=device)
-    sign_a = torch.empty(BH, K, N, dtype=torch.int8, device=device)
-    boundary_b = torch.empty(BH, K, M, dtype=torch.int16, device=device)
-    sign_b = torch.empty(BH, K, M, dtype=torch.int8, device=device)
-
-    BLOCK = 1024
-    slice_a = N * K
-    slice_b = M * K
-    fused_quant_bipolar_batched_kernel[(triton.cdiv(slice_a, BLOCK), BH)](
-        a_flat, boundary_a, sign_a, inv_scale_a,
-        q_max, q_min, max_rng_val, slice_a, N, K, BLOCK,
-    )
-    fused_quant_bipolar_batched_kernel[(triton.cdiv(slice_b, BLOCK), BH)](
-        b_flat, boundary_b, sign_b, inv_scale_b,
-        q_max, q_min, max_rng_val, slice_b, M, K, BLOCK,
-    )
-
-    rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, device)
-    V = 2 ** sc_prec + 1
-    cum_table_bytes = K * (stoc_len + 1) * V * 2
-    if cum_table_bytes > _COMPACT_ENABLE_THRESHOLD_BYTES:
-        raise RuntimeError(
-            "Compact enable path not supported in N!=M variant; shrink K or stoc_len."
-        )
-    cum_indicator, k_table = _get_cached_enable_tables(
-        config, sc_prec, device, rand_seqs_a_t, rand_seqs_b_t, stoc_len)
-    V_actual = cum_indicator.shape[2]
-    out_scale = scale_a * scale_b  # (BH,)
-
-    output = torch.empty(BH, N, M, dtype=torch.float32, device=device)
-    if N <= 64 or M <= 64:
-        BLOCK_M, BLOCK_N = 16, 16
-    else:
-        BLOCK_M, BLOCK_N = 32, 32
-    if K >= 4 and K % 4 == 0:
-        BLOCK_K = 4
-    elif K % 2 == 0:
-        BLOCK_K = 2
-    else:
-        BLOCK_K = 1
-    nw = 8 if BLOCK_M == 32 else 2
-    grid_mm = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N), BH)
-    enable_matmul_bipolar_batched_kernel[grid_mm](
-        cum_indicator, k_table,
-        boundary_a, boundary_b,
-        sign_a, sign_b,
-        output, out_scale,
-        N, M, K,
-        stoc_len, V_actual, q_max_sq,
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        num_warps=nw,
-    )
-    return output
-
-
-def sc_av_matmul(
-    attn: torch.Tensor,
-    v: torch.Tensor,
-    sc_prec: int = 8,
-    stoc_len: int | None = None,
-) -> torch.Tensor:
-    """Bipolar int8 SC attn @ V matmul, BH-batched (single kernel launch).
-
-    attn: (B, H, N, Nk)  — softmax output
-    v:    (B, H, Nk, D)  — value
-    Returns:
-        (B, H, N, D) in attn.dtype.
-    """
+def sc_av_matmul(attn: torch.Tensor, v: torch.Tensor,
+                 sc_prec: int | None = None, stoc_len: int | None = None) -> torch.Tensor:
+    """SC softmax·V. ``attn``: (B, H, N, Nk), ``v``: (B, H, Nk, D) -> (B, H, N, D)."""
     B, H, N, Nk = attn.shape
-    _, _, _, D = v.shape
-    if stoc_len is None:
-        stoc_len = 2 ** sc_prec
-    # Inner contraction dim for AV is Nk (seq length).
-    config = _get_config(Nk, sc_prec)
-
-    a_flat = attn.reshape(B * H, N, Nk).float().contiguous()
-    v_t_flat = v.transpose(-1, -2).reshape(B * H, D, Nk).float().contiguous()
-
-    a_maxs = a_flat.amax(dim=(1, 2))
-    a_mins = a_flat.amin(dim=(1, 2))
-    v_maxs = v_t_flat.amax(dim=(1, 2))
-    v_mins = v_t_flat.amin(dim=(1, 2))
-
-    out = _sc_matmul_enable_batched_bipolar_nm(
-        a_flat, v_t_flat,
-        a_maxs, a_mins, v_maxs, v_mins,
-        sc_prec, config, stoc_len,
-    )
+    D = v.shape[-1]
+    sc_prec = rt.state()["sc_prec"] if sc_prec is None else int(sc_prec)
+    a3 = attn.float().reshape(B * H, N, Nk).contiguous()
+    v3 = v.float().transpose(-1, -2).reshape(B * H, D, Nk).contiguous()
+    out = _sc_attn_op("av", a3, v3, "per_row", sc_prec, stoc_len)
     return out.reshape(B, H, N, D).to(attn.dtype)

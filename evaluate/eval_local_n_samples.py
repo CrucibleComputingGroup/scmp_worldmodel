@@ -39,13 +39,15 @@ from diffusers.schedulers import PNDMScheduler, DPMSolverMultistepScheduler
 
 from dataset.dataset_util import euler2rotm, rotm2euler
 from models import get_models
-from models.sc_integration import reconfigure, set_skip_blocks, clear_skip_blocks
+from models.sc_integration import (reconfigure, set_skip_blocks, clear_skip_blocks,
+                                   configure_from_env, cost_summary, sc_state)
 from sample.pipeline_trajectory2videogen import Trajectory2VideoGenPipeline
 from evaluate.compute_psnr_ssim import process_video_psnr_ssim
 from util import update_paths
 
 
-BRIDGE_ROOT = "/home/dingqy/Bench/IRASim/robotdata/opensource_robotdata/bridge"
+BRIDGE_ROOT = os.environ.get(
+    "BRIDGE_ROOT", "/home/dingqy/Bench/IRASim/robotdata/opensource_robotdata/bridge")
 GT_LATENT_DIR = f"{BRIDGE_ROOT}/evaluation_latent_videos/test_sample_latent_videos"
 GT_VIDEO_DIR = f"{BRIDGE_ROOT}/evaluation_videos/test_sample_videos"
 ANNOT_DIR = f"{BRIDGE_ROOT}/annotation/test"
@@ -66,6 +68,24 @@ def parse_skip(skip_str: str) -> dict:
         op, blocks = clause.split("=")
         out[op.strip()] = [int(x) for x in blocks.split(",") if x.strip()]
     return out
+
+
+def check_table_deployment(prov: dict, skip_map: dict, sq_path):
+    """An MP table is fitted on one deployment: the skipped (op, block) set and
+    the SmoothQuant transform both change which matmuls run on SC and what
+    operands they quantize. Refuse to deploy it under a different one."""
+    want_skip = {k: sorted(v) for k, v in (prov.get("skip") or {}).items() if v}
+    have_skip = {k: sorted(v) for k, v in skip_map.items() if v}
+    if "skip" in prov and want_skip != have_skip:
+        raise SystemExit(f"MP table was calibrated with skip={want_skip} but this "
+                         f"run uses skip={have_skip}")
+    if "smoothquant_scales" in prov:
+        want = prov["smoothquant_scales"]
+        have = os.path.abspath(sq_path) if sq_path else None
+        if (want is None) != (have is None) or (want and os.path.basename(want)
+                                                != os.path.basename(have)):
+            raise SystemExit(f"MP table was calibrated with SC_SMOOTH_SCALES={want} "
+                             f"but this run uses {have}")
 
 
 def build_args(config_path: str, infer_steps: int):
@@ -111,7 +131,14 @@ def make_pipe(args, vae, model, scheduler_kind: str):
     return Trajectory2VideoGenPipeline(vae=vae, scheduler=scheduler, transformer=model)
 
 
-def gen_one(pipe, mask_x, actions, args, device):
+def sample_generator(key: str, seed: int, device):
+    """Per-sample noise generator, identical across arms for the same key, so
+    every config is scored on the SAME initial noise (paired comparison)."""
+    import zlib
+    return torch.Generator(device=device).manual_seed(int(seed) + zlib.crc32(key.encode()))
+
+
+def gen_one(pipe, mask_x, actions, args, device, generator=None):
     with torch.no_grad():
         videos, latents = pipe(
             actions.to(device).to(torch.float32),
@@ -121,6 +148,7 @@ def gen_one(pipe, mask_x, actions, args, device):
             num_inference_steps=args.infer_num_sampling_steps,
             guidance_scale=args.guidance_scale,
             device=device, return_dict=False, output_type="both",
+            generator=generator,
         )
     return videos, latents
 
@@ -174,26 +202,85 @@ def main():
     p.add_argument("--scheduler", choices=["PNDM", "DPM"], default="PNDM")
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
-    p.add_argument("--out_root", default="/home/dingqy/Bench/IRASim/results/local_n_eval")
+    p.add_argument("--keys_file", default=None,
+                   help="JSON list of sample keys to evaluate (e.g. diverse_300.json); "
+                        "overrides the default sorted-first-N selection")
+    p.add_argument("--out_root", default=os.environ.get(
+        "EVAL_OUT_ROOT", "/home/dingqy/Bench/IRASim/results/local_n_eval"))
+    p.add_argument("--naive_int8", action="store_true",
+                   help="replace SC kernels with naive per-tensor int8 fake-quant "
+                        "(uniform quantization baseline); ops still selected by attention_mode")
+    p.add_argument("--naive_bits", type=int, default=8,
+                   help="bit width for --naive_int8 (WxAx, x=bits); 8 reproduces the original baseline")
+    p.add_argument("--naive_asymm", action="store_true",
+                   help="use asymmetric (zero-point) quantization instead of symmetric for --naive_int8")
+    p.add_argument("--int_baseline", choices=["int", "bitmod"], default=None,
+                   help="scmp_vit deterministic baselines over the SC ops: 'int' = W=A asym "
+                        "per-row x 128 chunk + per-row attention; 'bitmod' = BitMoD weights "
+                        "(--w_datatype, group 128) + INT8 activations/attention")
+    p.add_argument("--int_bits", type=int, default=8)
+    p.add_argument("--w_datatype", default="mixed_bitmod",
+                   help="BitMoD weight datatype for --int_baseline bitmod")
+    p.add_argument("--save_latents", action="store_true",
+                   help="also save each sample's predicted latent to <out>/latents/<key>.pt")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Initial-noise seed; each sample uses seed + crc32(key), "
+                        "so arms are paired on identical noise.")
     cli = p.parse_args()
 
     args = build_args(cli.config, cli.inference_steps)
     skip_map = parse_skip(cli.skip)
 
+    if cli.naive_int8:
+        from evaluate.eval_with_naive_int8 import install_naive_int8_patches
+        install_naive_int8_patches(bits=cli.naive_bits, asymm=cli.naive_asymm)
+        b = cli.naive_bits
+        print(f"naive W{b}A{b}_{'asymm' if cli.naive_asymm else 'symm'} patches "
+              f"installed over sc_* kernels", flush=True)
+
+    if cli.int_baseline:
+        if cli.naive_int8:
+            raise SystemExit("--int_baseline and --naive_int8 are exclusive")
+        from evaluate.int_baselines import install as install_int
+        print("int baseline:", install_int(cli.int_baseline, cli.int_bits, cli.w_datatype), flush=True)
+
     device = torch.device("cuda:0")
     vae = AutoencoderKL.from_pretrained(args.vae_model_path, subfolder="vae").to(device).eval()
     vae.requires_grad_(False)
     model = load_model(args, device)
+    sq_path = os.environ.get("SC_SMOOTH_SCALES")
+    if sq_path:  # SmoothQuant: attach calibrated per-channel scales to linears
+        payload = torch.load(sq_path, map_location=device, weights_only=False)
+        named = dict(model.named_modules())
+        n_att = 0
+        for name, s in payload["scales"].items():
+            if name in named:
+                named[name]._sc_smooth_scales = s.to(device).float()
+                n_att += 1
+        print(f"smoothquant: attached {n_att} scale vectors (alpha={payload['alpha']})", flush=True)
     reconfigure(args.attention_mode)
     clear_skip_blocks()
     for op, blocks in skip_map.items():
         set_skip_blocks(op, blocks)
+    sc_cfg = configure_from_env(model)
+    if sc_cfg["mp_table"]:
+        check_table_deployment(sc_cfg["mp_table"], skip_map, sq_path)
     pipe = make_pipe(args, vae, model, cli.scheduler)
     print(f"[shard {cli.shard}/{cli.num_shards}] variant={args.attention_mode} skip={skip_map} "
           f"steps={args.infer_num_sampling_steps} sched={cli.scheduler}", flush=True)
 
     # Decide which samples to handle this shard.
-    all_files = sorted(f for f in os.listdir(GT_LATENT_DIR) if f.endswith(".pt"))[: cli.num_samples]
+    if getattr(cli, "keys_file", None):   # explicit diverse-sample list
+        keys = json.load(open(cli.keys_file))[: cli.num_samples]
+        all_files = [f"{k}.pt" for k in keys]
+    else:
+        all_files = sorted(f for f in os.listdir(GT_LATENT_DIR) if f.endswith(".pt"))[: cli.num_samples]
+    if sc_cfg["mp_table"] and sc_cfg["mp_table"].get("calib_keys"):
+        overlap = {f[:-3] for f in all_files} & set(sc_cfg["mp_table"]["calib_keys"])
+        if overlap:
+            raise SystemExit(f"{len(overlap)} eval samples were used to calibrate the "
+                             f"MP table (e.g. {sorted(overlap)[:3]}); evaluate on a "
+                             f"disjoint key set")
     shard_files = all_files[cli.shard::cli.num_shards]
     print(f"[shard {cli.shard}] {len(shard_files)}/{len(all_files)} samples", flush=True)
 
@@ -209,6 +296,11 @@ def main():
     for fn in shard_files:
         eid, cam, start = parse_key(fn)
         key = f"{eid}_{cam}_{start}"
+        done_path = os.path.join(met_dir, f"{key}.json")
+        if os.path.exists(done_path):  # resume: already computed in a prior run
+            with open(done_path) as f:
+                metrics.append(json.load(f))
+            continue
         ann_path = os.path.join(ANNOT_DIR, f"{eid}.json")
         if not os.path.exists(ann_path):
             print(f"  [{key}] skip — no annotation", flush=True)
@@ -227,10 +319,18 @@ def main():
             actions = torch.from_numpy(actions_np).float().unsqueeze(0)
             mask_x = gt_lat[0:1].unsqueeze(0)
 
+            cost_summary(clear=True)
             t0 = time.time()
-            videos, pred_lat = gen_one(pipe, mask_x, actions, args, device)
+            videos, pred_lat = gen_one(pipe, mask_x, actions, args, device,
+                                       generator=sample_generator(key, cli.seed, device))
+            cyc = cost_summary(clear=True)
+            from models.sc_integration import sc_runtime as _rt
+            sig = _rt.sigma_summary(clear=True) if _rt.measuring() else None
             dt = time.time() - t0
             pred_lat = pred_lat.squeeze(0)
+            if cli.save_latents:
+                os.makedirs(os.path.join(out_dir, "latents"), exist_ok=True)
+                torch.save(pred_lat.detach().float().cpu(), os.path.join(out_dir, "latents", f"{key}.pt"))
             l2 = F.mse_loss(pred_lat[1:], gt_lat[1:]).item()
 
             mp4_path = os.path.join(vid_dir, f"{key}.mp4")
@@ -242,7 +342,14 @@ def main():
                 "psnr": round(float(ps["PSNR"]), 3),
                 "ssim": round(float(ps["SSIM"]), 3),
                 "infer_seconds": round(dt, 2),
+                # MAC-weighted realized stream length over every SC op
+                # (attention included) -- the iso-compute axis.
+                "avg_cycles": round(cyc["ALL"], 3),
+                "avg_cycles_per_op": {k: round(v, 3) for k, v in cyc.items()
+                                      if k not in ("ALL", "mac_share")},
             }
+            if sig is not None:
+                metric["deploy_sigma"] = {k: round(v, 5) for k, v in sig.items()}
             with open(os.path.join(met_dir, f"{key}.json"), "w") as f:
                 json.dump(metric, f)
             metrics.append(metric)
@@ -261,12 +368,22 @@ def main():
         mean_l2 = sum(m["latent_l2"] for m in metrics) / len(metrics)
         mean_psnr = sum(m["psnr"] for m in metrics) / len(metrics)
         mean_ssim = sum(m["ssim"] for m in metrics) / len(metrics)
+        cyc_vals = [m["avg_cycles"] for m in metrics if "avg_cycles" in m]
+        st = sc_state()
         summary = {
             "tag": cli.tag, "shard": cli.shard, "num_shards": cli.num_shards,
             "variant": args.attention_mode, "skip": {k: list(v) for k, v in skip_map.items()},
-            "steps": args.infer_num_sampling_steps, "scheduler": cli.scheduler,
+            "steps": args.infer_num_sampling_steps, "scheduler": cli.scheduler, "seed": cli.seed,
             "n_samples_done": len(metrics),
             "mean_l2": round(mean_l2, 4), "mean_psnr": round(mean_psnr, 3), "mean_ssim": round(mean_ssim, 3),
+            "mean_avg_cycles": (round(sum(cyc_vals) / len(cyc_vals), 3) if cyc_vals else None),
+            "sc": {"sc_prec": st["sc_prec"], "halve": st["halve"], "chunk_d": st["chunk_d"],
+                   "qk_granularity": st["qk_granularity"],
+                   "uniform_stoc_len": st["uniform_stoc_len"],
+                   "step_schedule": st["step_schedule"] is not None,
+                   "mp_table": (st["mp_table"] or {}).get("path"),
+                   "mp_ops": sorted(st["mp_ops"]),
+                   "smoothquant": os.environ.get("SC_SMOOTH_SCALES")},
             "per_sample": metrics,
         }
         with open(os.path.join(out_dir, f"summary_shard_{cli.shard}.json"), "w") as f:
